@@ -16,6 +16,9 @@ losses = 0
 # ===== SETTINGS =====
 ATR_MULTIPLIER = 1.5
 
+# ✅ Allowed symbols (VERY IMPORTANT)
+ALLOWED_SYMBOLS = ["NIFTY", "BANKNIFTY", "GOLDPETAL", "BTCUSDT"]
+
 # ===== SESSION FUNCTION =====
 def is_trading_session(market):
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -36,24 +39,39 @@ def is_trading_session(market):
     return True
 
 
+# ===== ROOT ROUTE (FOR KUMA) =====
 @app.route("/")
 def home():
     return "Multi-Market Trend Bot Running"
 
 
+# ===== WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global position, entry_price, sl, wins, losses
 
     data = request.json
 
+    if not data:
+        return jsonify({"status": "no_data"}), 400
+
+    # 🔥 GET DATA
+    symbol = data.get("symbol")
     action = data.get("action")
     price = float(data.get("price", 0))
     atr = float(data.get("atr", 5))
     ema = float(data.get("ema", 0))
     market = data.get("market", "NIFTY")
 
-    print("Signal:", data)
+    # ✅ Normalize action
+    action = action.lower() if action else None
+
+    print("Signal received:", data)
+
+    # 🚨 SYMBOL VALIDATION (FIXES MISMATCH)
+    if symbol not in ALLOWED_SYMBOLS:
+        print(f"Ignored unknown symbol: {symbol}")
+        return jsonify({"status": "ignored_symbol"})
 
     # ===== SESSION FILTER =====
     if not is_trading_session(market):
@@ -71,8 +89,8 @@ def webhook():
         entry_price = price
         sl = price - (atr * ATR_MULTIPLIER)
 
-        trade_log.append(f"{market} BUY at {price} | SL: {sl}")
-        print(f"BUY at {price}")
+        trade_log.append(f"{symbol} BUY at {price} | SL: {sl}")
+        print(f"{symbol} BUY at {price}")
 
     # ===== TRAILING STOP =====
     if position == "BUY":
@@ -80,7 +98,7 @@ def webhook():
 
         if new_sl > sl:
             sl = new_sl
-            print(f"SL Trailed to {sl}")
+            print(f"{symbol} SL Trailed to {sl}")
 
         # ===== EXIT =====
         if price <= sl:
@@ -91,8 +109,8 @@ def webhook():
             else:
                 losses += 1
 
-            trade_log.append(f"{market} EXIT at {price} | PnL: {pnl}")
-            print(f"EXIT at {price}, PnL: {pnl}")
+            trade_log.append(f"{symbol} EXIT at {price} | PnL: {pnl}")
+            print(f"{symbol} EXIT at {price}, PnL: {pnl}")
 
             position = None
 
@@ -104,10 +122,11 @@ def webhook():
     })
 
 
+# ===== LOG ROUTE =====
 @app.route("/log")
 def log():
     return {
-        "trades": trade_log,
+        "trades": trade_log[-50:],  # last 50 trades
         "wins": wins,
         "losses": losses
     }
