@@ -1,26 +1,36 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 import os
+import time
 
 app = Flask(__name__)
 
-# ===== STATE (MULTI SYMBOL) =====
-positions = {}  # stores data per symbol
-
+# ===== GLOBAL STATE =====
+positions = {}  # symbol-wise positions
 trade_log = []
 wins = 0
 losses = 0
 
 # ===== SETTINGS =====
-ATR_MULTIPLIER = 1.5
 
+# % Stop Loss per market
+SL_CONFIG = {
+    "CRYPTO": 0.003,     # 0.3%
+    "MCX": 0.002,        # 0.2%
+    "NIFTY": 0.0015      # 0.15%
+}
+
+# Cooldown (seconds between trades per symbol)
+COOLDOWN = 60
+
+# Allowed symbols
 ALLOWED_SYMBOLS = [
     "NIFTY", "BANKNIFTY",
     "GOLDPETAL", "SILVERMIC", "CRUDEOILM",
     "BTCUSDT", "ETHUSDT"
 ]
 
-# ===== SESSION FUNCTION =====
+# ===== SESSION FILTER =====
 def is_trading_session(market):
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     h, m = ist.hour, ist.minute
@@ -54,7 +64,6 @@ def webhook():
     symbol = data.get("symbol")
     action = data.get("action")
     price = float(data.get("price", 0))
-    atr = float(data.get("atr", 5))
     market = data.get("market", "NIFTY")
 
     action = action.lower() if action else None
@@ -63,27 +72,34 @@ def webhook():
 
     # ===== VALIDATION =====
     if symbol not in ALLOWED_SYMBOLS:
-        print(f"Ignored symbol: {symbol}")
         return jsonify({"status": "ignored_symbol"})
 
     if not is_trading_session(market):
-        print(f"{symbol} market closed")
         return jsonify({"status": "outside_session"})
 
-    # ===== INIT SYMBOL STATE =====
+    # ===== INIT STATE =====
     if symbol not in positions:
         positions[symbol] = {
             "position": None,
             "entry_price": 0,
-            "sl": 0
+            "sl": 0,
+            "last_trade_time": 0
         }
 
     pos = positions[symbol]
 
+    # ===== COOLDOWN =====
+    now = time.time()
+    if now - pos["last_trade_time"] < COOLDOWN:
+        return jsonify({"status": "cooldown_active"})
+
+    # ===== SL CONFIG =====
+    sl_percent = SL_CONFIG.get(market, 0.002)
+
     # ===== BUY =====
     if action == "buy":
 
-        # Close short if exists
+        # Close short
         if pos["position"] == "SELL":
             pnl = pos["entry_price"] - price
 
@@ -93,20 +109,19 @@ def webhook():
                 losses += 1
 
             trade_log.append(f"{symbol} EXIT SELL at {price} | PnL: {pnl}")
-            print(f"{symbol} EXIT SELL at {price}, PnL: {pnl}")
 
         # Open long
         pos["position"] = "BUY"
         pos["entry_price"] = price
-        pos["sl"] = price - (atr * ATR_MULTIPLIER)
+        pos["sl"] = price * (1 - sl_percent)
+        pos["last_trade_time"] = now
 
         trade_log.append(f"{symbol} BUY at {price} | SL: {pos['sl']}")
-        print(f"{symbol} BUY at {price}")
 
     # ===== SELL =====
     elif action == "sell":
 
-        # Close long if exists
+        # Close long
         if pos["position"] == "BUY":
             pnl = price - pos["entry_price"]
 
@@ -116,19 +131,18 @@ def webhook():
                 losses += 1
 
             trade_log.append(f"{symbol} EXIT BUY at {price} | PnL: {pnl}")
-            print(f"{symbol} EXIT BUY at {price}, PnL: {pnl}")
 
         # Open short
         pos["position"] = "SELL"
         pos["entry_price"] = price
-        pos["sl"] = price + (atr * ATR_MULTIPLIER)
+        pos["sl"] = price * (1 + sl_percent)
+        pos["last_trade_time"] = now
 
         trade_log.append(f"{symbol} SELL at {price} | SL: {pos['sl']}")
-        print(f"{symbol} SELL at {price}")
 
     # ===== TRAILING STOP =====
     if pos["position"] == "BUY":
-        new_sl = price - (atr * ATR_MULTIPLIER)
+        new_sl = price * (1 - sl_percent)
 
         if new_sl > pos["sl"]:
             pos["sl"] = new_sl
@@ -142,12 +156,10 @@ def webhook():
                 losses += 1
 
             trade_log.append(f"{symbol} SL HIT BUY at {price} | PnL: {pnl}")
-            print(f"{symbol} SL HIT BUY at {price}")
-
             pos["position"] = None
 
     elif pos["position"] == "SELL":
-        new_sl = price + (atr * ATR_MULTIPLIER)
+        new_sl = price * (1 + sl_percent)
 
         if new_sl < pos["sl"]:
             pos["sl"] = new_sl
@@ -161,8 +173,6 @@ def webhook():
                 losses += 1
 
             trade_log.append(f"{symbol} SL HIT SELL at {price} | PnL: {pnl}")
-            print(f"{symbol} SL HIT SELL at {price}")
-
             pos["position"] = None
 
     return jsonify({
