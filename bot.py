@@ -1,128 +1,130 @@
-# bot.py
+# bot.py - Paper Trading with Dynamic Trailing Stop, No Fixed TP
 from flask import Flask, request, jsonify
-import os
-import time
-from threading import Thread
+from datetime import datetime
 
 app = Flask(__name__)
 
-# =====================
-# CONFIGURATION
-# =====================
-RISK_PER_TRADE = 0.01  # Risk 1% of account balance
-ACCOUNT_BALANCE = 1000  # Replace with API call to get live balance
+# ---------- CONFIG ----------
+RISK_PERCENT = 1        # risk per trade (%)
+TRAILING_SL_PERCENT = 0.5  # trailing stop-loss distance (%)
+# -----------------------------
 
-# Trailing stop-loss & take-profit settings
-BASE_STOP_LOSS_PCT = 0.01  # Initial 1% stop-loss
-BASE_TAKE_PROFIT_PCT = 0.02  # Initial 2% target
-TRAILING_SL_STEP_PCT = 0.005  # Adjust SL by 0.5% per 1% favorable price move
-
+# Store trend by symbol
+current_trend = {}
 # Store active trades
-active_trades = {}  # key: symbol, value: trade dict
+active_trades = []
 
-# =====================
-# RISK MANAGEMENT
-# =====================
-def get_position_size(account_balance, risk_per_trade, stop_loss_pct):
-    """Calculate trade size based on account balance and stop-loss risk"""
-    return (account_balance * risk_per_trade) / stop_loss_pct
+def calculate_position_size(account_balance, entry_price, stop_loss_price, risk_percent):
+    risk_amount = account_balance * (risk_percent / 100)
+    stop_loss_distance = abs(entry_price - stop_loss_price)
+    if stop_loss_distance == 0:
+        return 0
+    return risk_amount / stop_loss_distance
 
-# =====================
-# TRADE EXECUTION
-# =====================
-def execute_trade(symbol, signal, price):
-    """Open a new trade based on webhook alert"""
-    position_size = get_position_size(ACCOUNT_BALANCE, RISK_PER_TRADE, BASE_STOP_LOSS_PCT)
-    
-    stop_loss = float(price) * (1 - BASE_STOP_LOSS_PCT) if signal.lower() == "buy" else float(price) * (1 + BASE_STOP_LOSS_PCT)
-    take_profit = float(price) * (1 + BASE_TAKE_PROFIT_PCT) if signal.lower() == "buy" else float(price) * (1 - BASE_TAKE_PROFIT_PCT)
+def open_trade(symbol, signal, price, entry_type, zone=None):
+    account_balance = 10000  # simulated balance
 
-    active_trades[symbol] = {
-        "signal": signal.lower(),
-        "entry_price": float(price),
-        "position_size": position_size,
+    # Initial trailing stop based on config
+    sl_distance = price * (TRAILING_SL_PERCENT / 100)
+    stop_loss = price - sl_distance if signal == "buy" else price + sl_distance
+
+    position_size = calculate_position_size(account_balance, price, stop_loss, RISK_PERCENT)
+
+    trade = {
+        "timestamp": str(datetime.now()),
+        "symbol": symbol,
+        "signal": signal,
+        "entry_type": entry_type,
+        "zone": zone,
+        "entry_price": price,
         "stop_loss": stop_loss,
-        "take_profit": take_profit
+        "position_size": position_size,
+        "status": "open",
+        "highest_price": price if signal == "buy" else None,
+        "lowest_price": price if signal == "sell" else None
     }
+    active_trades.append(trade)
+    print(f"--- PAPER TRADE OPENED ---\n{trade}\n--------------------------")
+    return trade
 
-    print(f"--- TRADE OPENED ---")
-    print(active_trades[symbol])
-    print("--------------------")
-    return True
-
-# =====================
-# TRAILING STOP-LOSS MANAGEMENT
-# =====================
-def update_trailing_sl(symbol, current_price):
-    trade = active_trades.get(symbol)
-    if not trade:
-        return
-
+def update_trailing_stop(trade, current_price):
+    # Buy trade: move stop-loss up as price moves
     if trade["signal"] == "buy":
-        price_move_pct = (current_price - trade["entry_price"]) / trade["entry_price"]
-        if price_move_pct > 0:
-            new_sl = trade["stop_loss"] + TRAILING_SL_STEP_PCT * (price_move_pct / BASE_STOP_LOSS_PCT) * trade["entry_price"]
+        if current_price > trade["highest_price"]:
+            trade["highest_price"] = current_price
+            new_sl = current_price - (current_price * TRAILING_SL_PERCENT / 100)
             if new_sl > trade["stop_loss"]:
                 trade["stop_loss"] = new_sl
+    # Sell trade: move stop-loss down as price moves
     elif trade["signal"] == "sell":
-        price_move_pct = (trade["entry_price"] - current_price) / trade["entry_price"]
-        if price_move_pct > 0:
-            new_sl = trade["stop_loss"] - TRAILING_SL_STEP_PCT * (price_move_pct / BASE_STOP_LOSS_PCT) * trade["entry_price"]
+        if current_price < trade["lowest_price"]:
+            trade["lowest_price"] = current_price
+            new_sl = current_price + (current_price * TRAILING_SL_PERCENT / 100)
             if new_sl < trade["stop_loss"]:
                 trade["stop_loss"] = new_sl
 
-# =====================
-# WEBHOOK ENDPOINT
-# =====================
-@app.route("/", methods=["GET"])
-def home():
-    return "LuxAlgo Multi-Instrument Bot Running 24/7!"
-
-@app.route("/", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        data = request.json
-        symbol = data.get("symbol")
-        signal = data.get("signal")
-        price = float(data.get("price"))
+    data = request.json
+    symbol = data.get("symbol")
+    raw_signal = data.get("signal", "").lower()
+    trend = data.get("trend", "").lower()
+    zone = data.get("zone", None)
+    price = data.get("price")
 
-        if not all([symbol, signal, price]):
-            return jsonify({"status": "error", "message": "Missing fields"}), 400
+    # Update trend if BOS
+    if "bos" in raw_signal:
+        current_trend[symbol] = trend
+        return jsonify({"status": "trend updated", "symbol": symbol, "trend": trend})
 
-        # Execute the trade
-        success = execute_trade(symbol, signal, price)
-        return jsonify({"status": "success" if success else "error", "trade": active_trades.get(symbol)})
+    # Ignore signals against trend
+    if symbol not in current_trend:
+        return jsonify({"status": "ignored", "reason": "trend not set yet"})
+    if current_trend[symbol] != trend:
+        return jsonify({"status": "ignored", "reason": "signal against trend"})
 
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    # Determine trade type
+    if "choch" in raw_signal:
+        entry_type = "primary"
+    elif "ob breakout" in raw_signal or "fvg" in raw_signal:
+        entry_type = "secondary"
+    else:
+        return jsonify({"status": "ignored", "reason": "unknown signal type"})
 
-# =====================
-# TRADE MANAGEMENT LOOP
-# =====================
-def manage_trades():
-    while True:
-        for symbol, trade in list(active_trades.items()):
-            # Replace this with real-time price feed from broker API
-            current_price = trade["entry_price"]  # placeholder
-            
-            # Update trailing stop-loss
-            update_trailing_sl(symbol, current_price)
+    # Map signal to buy/sell
+    if "bullish" in raw_signal:
+        signal = "buy"
+    elif "bearish" in raw_signal:
+        signal = "sell"
+    else:
+        return jsonify({"status": "ignored", "reason": "unknown bullish/bearish"})
 
-            # Check stop-loss or take-profit hit
-            if trade["signal"] == "buy":
-                if current_price <= trade["stop_loss"] or current_price >= trade["take_profit"]:
-                    print(f"Closing trade {symbol}")
-                    del active_trades[symbol]
-            elif trade["signal"] == "sell":
-                if current_price >= trade["stop_loss"] or current_price <= trade["take_profit"]:
-                    print(f"Closing trade {symbol}")
-                    del active_trades[symbol]
-        time.sleep(5)  # loop every 5 seconds
+    # Open paper trade
+    trade = open_trade(symbol, signal, price, entry_type, zone)
+    return jsonify({"status": "trade executed", "trade": trade})
 
-# =====================
-# RUN BOT
-# =====================
+@app.route("/update_price", methods=["POST"])
+def update_price():
+    """Send current price to update trailing stops."""
+    data = request.json
+    symbol = data.get("symbol")
+    current_price = data.get("price")
+
+    for trade in active_trades:
+        if trade["symbol"] == symbol and trade["status"] == "open":
+            update_trailing_stop(trade, current_price)
+            # Close trade if price hits trailing stop
+            if (trade["signal"] == "buy" and current_price <= trade["stop_loss"]) or \
+               (trade["signal"] == "sell" and current_price >= trade["stop_loss"]):
+                trade["status"] = "closed"
+                trade["exit_price"] = current_price
+                trade["closed_at"] = str(datetime.now())
+                print(f"--- PAPER TRADE CLOSED ---\n{trade}\n------------------------")
+    return jsonify({"status": "updated", "symbol": symbol})
+
+@app.route("/trades", methods=["GET"])
+def get_trades():
+    return jsonify(active_trades)
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    Thread(target=manage_trades, daemon=True).start()
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
