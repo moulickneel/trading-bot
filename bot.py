@@ -1,4 +1,4 @@
-# bot.py - Paper Trading with Dynamic Trailing Stop, No Fixed TP
+# bot.py - Full SMC Paper Trading Bot with Status and Trailing Stop
 from flask import Flask, request, jsonify
 from datetime import datetime
 
@@ -14,6 +14,7 @@ current_trend = {}
 # Store active trades
 active_trades = []
 
+# ----------------- UTILITY FUNCTIONS -----------------
 def calculate_position_size(account_balance, entry_price, stop_loss_price, risk_percent):
     risk_amount = account_balance * (risk_percent / 100)
     stop_loss_distance = abs(entry_price - stop_loss_price)
@@ -24,7 +25,6 @@ def calculate_position_size(account_balance, entry_price, stop_loss_price, risk_
 def open_trade(symbol, signal, price, entry_type, zone=None):
     account_balance = 10000  # simulated balance
 
-    # Initial trailing stop based on config
     sl_distance = price * (TRAILING_SL_PERCENT / 100)
     stop_loss = price - sl_distance if signal == "buy" else price + sl_distance
 
@@ -48,20 +48,32 @@ def open_trade(symbol, signal, price, entry_type, zone=None):
     return trade
 
 def update_trailing_stop(trade, current_price):
-    # Buy trade: move stop-loss up as price moves
     if trade["signal"] == "buy":
         if current_price > trade["highest_price"]:
             trade["highest_price"] = current_price
             new_sl = current_price - (current_price * TRAILING_SL_PERCENT / 100)
             if new_sl > trade["stop_loss"]:
                 trade["stop_loss"] = new_sl
-    # Sell trade: move stop-loss down as price moves
     elif trade["signal"] == "sell":
         if current_price < trade["lowest_price"]:
             trade["lowest_price"] = current_price
             new_sl = current_price + (current_price * TRAILING_SL_PERCENT / 100)
             if new_sl < trade["stop_loss"]:
                 trade["stop_loss"] = new_sl
+
+# ----------------- ENDPOINTS -----------------
+
+@app.route("/", methods=["GET"])
+def home():
+    total_trades = len(active_trades)
+    open_trades = len([t for t in active_trades if t["status"] == "open"])
+    closed_trades = total_trades - open_trades
+    return f"""
+    <h2>SMC Bot is running ✅</h2>
+    <p>Total Trades: {total_trades} | Open: {open_trades} | Closed: {closed_trades}</p>
+    <p>Current Trends: {current_trend}</p>
+    <p>Use /trades, /webhook, or /update_price for functionality.</p>
+    """
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -99,13 +111,11 @@ def webhook():
     else:
         return jsonify({"status": "ignored", "reason": "unknown bullish/bearish"})
 
-    # Open paper trade
     trade = open_trade(symbol, signal, price, entry_type, zone)
     return jsonify({"status": "trade executed", "trade": trade})
 
 @app.route("/update_price", methods=["POST"])
 def update_price():
-    """Send current price to update trailing stops."""
     data = request.json
     symbol = data.get("symbol")
     current_price = data.get("price")
@@ -124,7 +134,15 @@ def update_price():
 
 @app.route("/trades", methods=["GET"])
 def get_trades():
-    return jsonify(active_trades)
+    open_trades = [t for t in active_trades if t["status"] == "open"]
+    closed_trades = [t for t in active_trades if t["status"] == "closed"]
+    return jsonify({
+        "total_trades": len(active_trades),
+        "open_trades": len(open_trades),
+        "closed_trades": len(closed_trades),
+        "trades": active_trades,
+        "current_trends": current_trend
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
