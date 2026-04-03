@@ -1,195 +1,159 @@
-# bot.py - Fully Automated SMC Paper Trading Bot for LuxAlgo Alerts
+# bot.py - Advanced SMC Automation Bot (Corrected Logic)
+
 from flask import Flask, request, jsonify
 from datetime import datetime
 
 app = Flask(__name__)
 
 # ---------- CONFIG ----------
-RISK_PERCENT = 1          # Risk per trade (%)
-TRAILING_SL_PERCENT = 0.5 # Trailing stop-loss distance (%)
-ACCOUNT_BALANCE = 10000   # Simulated balance
-# -----------------------------
+RISK_PERCENT = 1
+RR_RATIO = 2                # Risk:Reward (1:2)
+TRAILING_AFTER_R = 1       # Start trailing after 1R move
+ACCOUNT_BALANCE = 10000
+# ----------------------------
 
-current_trend = {}  # confirmed trend per symbol
-pending_chos = {}   # pending early reversal trades
+# State
+bias_map = {}          # CHoCH-based directional bias
+bos_confirmed = {}     # BOS confirmation (optional strength)
 active_trades = []
 
-# ----------------- UTILITY FUNCTIONS -----------------
-def calculate_position_size(account_balance, entry_price, stop_loss_price, risk_percent):
-    risk_amount = account_balance * (risk_percent / 100)
-    distance = abs(entry_price - stop_loss_price)
+# ----------------- UTILS -----------------
+
+def calculate_position_size(entry, sl):
+    risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
+    distance = abs(entry - sl)
     if distance == 0:
         return 0
     return risk_amount / distance
 
-def open_trade(symbol, signal, entry_price, stop_loss, entry_type, zone=None, take_profit=None):
-    position_size = calculate_position_size(ACCOUNT_BALANCE, entry_price, stop_loss, RISK_PERCENT)
-    trade = {
-        "timestamp": str(datetime.now()),
-        "symbol": symbol,
-        "signal": signal,
-        "entry_type": entry_type,
-        "zone": zone,
-        "entry_price": entry_price,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "position_size": position_size,
-        "status": "open",
-        "highest_price": entry_price if signal == "buy" else None,
-        "lowest_price": entry_price if signal == "sell" else None
-    }
-    active_trades.append(trade)
-    print(f"--- PAPER TRADE OPENED ---\n{trade}\n--------------------------")
-    return trade
-
-def update_trailing_stop(trade, current_price, trailing_percent):
-    if trade["signal"] == "buy":
-        if current_price > trade["highest_price"]:
-            trade["highest_price"] = current_price
-            new_sl = current_price - current_price * trailing_percent / 100
-            if new_sl > trade["stop_loss"]:
-                trade["stop_loss"] = new_sl
-    elif trade["signal"] == "sell":
-        if current_price < trade["lowest_price"]:
-            trade["lowest_price"] = current_price
-            new_sl = current_price + current_price * trailing_percent / 100
-            if new_sl < trade["stop_loss"]:
-                trade["stop_loss"] = new_sl
-
-# ----------------- STRUCTURE SL/TP -----------------
-def get_sl_tp(entry_price, zone, signal):
-    """
-    Returns SL/TP based on zone
-    FVG: SL below/above gap, TP at next structure
-    OB: SL below/above OB, TP at next structure
-    Swing OB: similar to OB
-    Currently using % placeholders
-    """
-    sl_percent = 0.5
-    tp_percent = 1.0
+def get_sl_tp(entry, signal):
+    # Basic structure-based placeholder (can be upgraded later)
+    sl_percent = 0.4
     if signal == "buy":
-        sl = entry_price - entry_price * sl_percent / 100
-        tp = entry_price + entry_price * tp_percent / 100
+        sl = entry - entry * sl_percent / 100
+        tp = entry + (entry - sl) * RR_RATIO
     else:
-        sl = entry_price + entry_price * sl_percent / 100
-        tp = entry_price - entry_price * tp_percent / 100
+        sl = entry + entry * sl_percent / 100
+        tp = entry - (sl - entry) * RR_RATIO
     return sl, tp
 
+def open_trade(symbol, signal, entry, zone):
+    sl, tp = get_sl_tp(entry, signal)
+    size = calculate_position_size(entry, sl)
+
+    trade = {
+        "symbol": symbol,
+        "signal": signal,
+        "zone": zone,
+        "entry_price": entry,
+        "stop_loss": sl,
+        "take_profit": tp,
+        "position_size": size,
+        "status": "open",
+        "entry_time": str(datetime.now()),
+        "moved_to_be": False
+    }
+    active_trades.append(trade)
+    print(f"OPEN TRADE: {trade}")
+    return trade
+
+def manage_trade(trade, price):
+    entry = trade["entry_price"]
+    sl = trade["stop_loss"]
+    tp = trade["take_profit"]
+
+    risk = abs(entry - sl)
+    current_profit = (price - entry) if trade["signal"] == "buy" else (entry - price)
+
+    # Move SL to breakeven after 1R
+    if not trade["moved_to_be"] and current_profit >= risk * TRAILING_AFTER_R:
+        trade["stop_loss"] = entry
+        trade["moved_to_be"] = True
+
+    # Close at TP
+    if (trade["signal"] == "buy" and price >= tp) or \
+       (trade["signal"] == "sell" and price <= tp):
+        trade["status"] = "closed"
+        trade["exit_price"] = price
+        trade["reason"] = "TP hit"
+
+    # Close at SL
+    elif (trade["signal"] == "buy" and price <= trade["stop_loss"]) or \
+         (trade["signal"] == "sell" and price >= trade["stop_loss"]):
+        trade["status"] = "closed"
+        trade["exit_price"] = price
+        trade["reason"] = "SL hit"
+
 # ----------------- ENDPOINTS -----------------
-@app.route("/", methods=["GET"])
+
+@app.route("/")
 def home():
     return jsonify({
-        "status": "SMC Bot Running",
-        "active_trades": len([t for t in active_trades if t["status"]=="open"]),
-        "confirmed_trends": current_trend,
-        "pending_chos": pending_chos
+        "status": "Advanced SMC Bot Running",
+        "bias": bias_map,
+        "bos_confirmed": bos_confirmed,
+        "active_trades": len([t for t in active_trades if t["status"]=="open"])
     })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
+
     symbol = data.get("symbol")
     raw_signal = (data.get("signal") or "").lower()
     price = data.get("price")
-    zone = data.get("zone")
+    zone = data.get("zone", None)
     trend = (data.get("trend") or "").lower()
 
-    if not symbol or not raw_signal or price is None or not trend:
-        return jsonify({"status":"error","reason":"missing fields"}),400
+    if not symbol or not raw_signal or price is None:
+        return jsonify({"error":"invalid data"}), 400
 
-    # Determine type of signal
-    signal = None
-    entry_type = None
-    trend_confirm = None
+    # Identify direction
+    direction = "buy" if "bullish" in raw_signal else "sell"
 
-    # CHoCH signals - early reversal
+    # ---------- CHOCH ----------
     if "choch" in raw_signal:
-        signal = "buy" if "bullish" in raw_signal else "sell"
-        entry_type = "primary"
-        trend_confirm = False
-    # BOS signals - trend confirmation
-    elif "bos" in raw_signal:
-        signal = "buy" if "bullish" in raw_signal else "sell"
-        entry_type = "primary"
-        trend_confirm = True
-    # OB Breakouts or FVG - secondary entries
-    elif "ob breakout" in raw_signal or "fvg" in raw_signal:
-        signal = "buy" if "bullish" in raw_signal else "sell"
-        entry_type = "secondary"
-        trend_confirm = None
-    else:
-        return jsonify({"status":"ignored","reason":"unknown signal"}),200
+        bias_map[symbol] = direction
+        bos_confirmed[symbol] = False
+        return jsonify({"status":"bias set from CHoCH", "bias": direction})
 
-    # ---- Handle CHoCH ----
-    if trend_confirm == False:
-        pending_chos[symbol] = {
-            "signal": signal,
-            "zone": zone,
-            "entry_type": entry_type,
-            "price": price,
-            "timestamp": str(datetime.now())
-        }
-        return jsonify({"status":"CHoCH recorded","symbol":symbol,"signal":signal})
+    # ---------- BOS ----------
+    if "bos" in raw_signal:
+        bos_confirmed[symbol] = True
+        return jsonify({"status":"bos confirmed", "symbol":symbol})
 
-    # ---- Handle BOS ----
-    if trend_confirm == True:
-        current_trend[symbol] = signal
-        # If pending CHoCH exists, execute it
-        if symbol in pending_chos:
-            choch = pending_chos.pop(symbol)
-            sl, tp = get_sl_tp(choch["price"], choch["zone"], choch["signal"])
-            trade = open_trade(symbol, choch["signal"], choch["price"], sl, choch["entry_type"], choch["zone"], tp)
-            return jsonify({"status":"trend confirmed, CHoCH trade executed","trade":trade})
-        return jsonify({"status":"trend updated","symbol":symbol,"trend":signal})
+    # ---------- ENTRY (FVG / OB / SWING OB) ----------
+    if "fvg" in raw_signal or "ob breakout" in raw_signal:
+        if symbol not in bias_map:
+            return jsonify({"status":"ignored","reason":"no CHOCH bias yet"})
 
-    # ---- Secondary entries ----
-    # Ignore if trend not confirmed
-    if symbol not in current_trend:
-        return jsonify({"status":"ignored","reason":"trend not confirmed yet"})
-    if (signal=="buy" and current_trend[symbol]!="buy") or (signal=="sell" and current_trend[symbol]!="sell"):
-        return jsonify({"status":"ignored","reason":"signal against confirmed trend"})
+        if bias_map[symbol] != direction:
+            return jsonify({"status":"ignored","reason":"against bias"})
 
-    sl, tp = get_sl_tp(price, zone, signal)
-    trade = open_trade(symbol, signal, price, sl, entry_type, zone, tp)
-    return jsonify({"status":"trade executed","trade":trade})
+        # Optional: require BOS confirmation
+        # if not bos_confirmed.get(symbol, False):
+        #     return jsonify({"status":"ignored","reason":"no BOS confirmation"})
+
+        trade = open_trade(symbol, direction, price, zone)
+        return jsonify({"status":"trade taken", "trade":trade})
+
+    return jsonify({"status":"ignored"})
 
 @app.route("/update_price", methods=["POST"])
 def update_price():
     data = request.json
     symbol = data.get("symbol")
-    current_price = data.get("price")
-    if not symbol or current_price is None:
-        return jsonify({"status":"error","reason":"missing fields"}),400
+    price = data.get("price")
 
     for trade in active_trades:
-        if trade["symbol"]==symbol and trade["status"]=="open":
-            update_trailing_stop(trade, current_price, TRAILING_SL_PERCENT)
-            # Close on stop-loss
-            if (trade["signal"]=="buy" and current_price<=trade["stop_loss"]) or \
-               (trade["signal"]=="sell" and current_price>=trade["stop_loss"]):
-                trade["status"]="closed"
-                trade["exit_price"]=current_price
-                trade["closed_at"]=str(datetime.now())
-                trade["reason"]="stop_loss hit"
-            # Close on take-profit
-            elif (trade["signal"]=="buy" and current_price>=trade["take_profit"]) or \
-                 (trade["signal"]=="sell" and current_price<=trade["take_profit"]):
-                trade["status"]="closed"
-                trade["exit_price"]=current_price
-                trade["closed_at"]=str(datetime.now())
-                trade["reason"]="take_profit hit"
-    return jsonify({"status":"prices updated","symbol":symbol})
+        if trade["symbol"] == symbol and trade["status"] == "open":
+            manage_trade(trade, price)
 
-@app.route("/trades", methods=["GET"])
-def get_trades():
-    return jsonify({
-        "total_trades": len(active_trades),
-        "open_trades": len([t for t in active_trades if t["status"]=="open"]),
-        "closed_trades": len([t for t in active_trades if t["status"]=="closed"]),
-        "trades": active_trades,
-        "confirmed_trends": current_trend,
-        "pending_chos": pending_chos
-    })
+    return jsonify({"status":"updated"})
 
-if __name__=="__main__":
+@app.route("/trades")
+def trades():
+    return jsonify(active_trades)
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
