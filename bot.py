@@ -1,200 +1,128 @@
+# bot.py
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
 import os
 import time
+from threading import Thread
 
 app = Flask(__name__)
 
-# ===== GLOBAL STATE =====
-positions = {}  # symbol-wise positions
-trade_log = []
-wins = 0
-losses = 0
+# =====================
+# CONFIGURATION
+# =====================
+RISK_PER_TRADE = 0.01  # Risk 1% of account balance
+ACCOUNT_BALANCE = 1000  # Replace with API call to get live balance
 
-# ===== SETTINGS =====
+# Trailing stop-loss & take-profit settings
+BASE_STOP_LOSS_PCT = 0.01  # Initial 1% stop-loss
+BASE_TAKE_PROFIT_PCT = 0.02  # Initial 2% target
+TRAILING_SL_STEP_PCT = 0.005  # Adjust SL by 0.5% per 1% favorable price move
 
-# % Stop Loss per market
-SL_CONFIG = {
-    "CRYPTO": 0.003,     # 0.3%
-    "MCX": 0.002,        # 0.2%
-    "NIFTY": 0.0015      # 0.15%
-}
+# Store active trades
+active_trades = {}  # key: symbol, value: trade dict
 
-# Cooldown (seconds between trades per symbol)
-COOLDOWN = 60
+# =====================
+# RISK MANAGEMENT
+# =====================
+def get_position_size(account_balance, risk_per_trade, stop_loss_pct):
+    """Calculate trade size based on account balance and stop-loss risk"""
+    return (account_balance * risk_per_trade) / stop_loss_pct
 
-# Allowed symbols
-ALLOWED_SYMBOLS = [
-    "NIFTY", "BANKNIFTY",
-    "GOLDPETAL", "SILVERMIC", "CRUDEOILM",
-    "BTCUSDT", "ETHUSDT"
-]
+# =====================
+# TRADE EXECUTION
+# =====================
+def execute_trade(symbol, signal, price):
+    """Open a new trade based on webhook alert"""
+    position_size = get_position_size(ACCOUNT_BALANCE, RISK_PER_TRADE, BASE_STOP_LOSS_PCT)
+    
+    stop_loss = float(price) * (1 - BASE_STOP_LOSS_PCT) if signal.lower() == "buy" else float(price) * (1 + BASE_STOP_LOSS_PCT)
+    take_profit = float(price) * (1 + BASE_TAKE_PROFIT_PCT) if signal.lower() == "buy" else float(price) * (1 - BASE_TAKE_PROFIT_PCT)
 
-# ===== SESSION FILTER =====
-def is_trading_session(market):
-    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    h, m = ist.hour, ist.minute
-
-    if market == "NIFTY":
-        return (h > 9 or (h == 9 and m >= 15)) and (h < 15 or (h == 15 and m <= 30))
-
-    elif market == "MCX":
-        return (h > 9 or (h == 9 and m >= 0)) and (h < 23 or (h == 23 and m <= 30))
-
-    elif market == "CRYPTO":
-        return True
-
-    return True
-
-
-@app.route("/")
-def home():
-    return "Multi-Market Bot Running"
-
-
-# ===== WEBHOOK =====
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    global wins, losses
-
-    data = request.json
-    if not data:
-        return jsonify({"status": "no_data"}), 400
-
-    symbol = data.get("symbol")
-    action = data.get("action")
-    price = float(data.get("price", 0))
-    market = data.get("market", "NIFTY")
-
-    action = action.lower() if action else None
-
-    print("Signal:", data)
-
-    # ===== VALIDATION =====
-    if symbol not in ALLOWED_SYMBOLS:
-        return jsonify({"status": "ignored_symbol"})
-
-    if not is_trading_session(market):
-        return jsonify({"status": "outside_session"})
-
-    # ===== INIT STATE =====
-    if symbol not in positions:
-        positions[symbol] = {
-            "position": None,
-            "entry_price": 0,
-            "sl": 0,
-            "last_trade_time": 0
-        }
-
-    pos = positions[symbol]
-
-    # ===== COOLDOWN =====
-    now = time.time()
-    if now - pos["last_trade_time"] < COOLDOWN:
-        return jsonify({"status": "cooldown_active"})
-
-    # ===== SL CONFIG =====
-    sl_percent = SL_CONFIG.get(market, 0.002)
-
-    # ===== BUY =====
-    if action == "buy":
-
-        # Close short
-        if pos["position"] == "SELL":
-            pnl = pos["entry_price"] - price
-
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-
-            trade_log.append(f"{symbol} EXIT SELL at {price} | PnL: {pnl}")
-
-        # Open long
-        pos["position"] = "BUY"
-        pos["entry_price"] = price
-        pos["sl"] = price * (1 - sl_percent)
-        pos["last_trade_time"] = now
-
-        trade_log.append(f"{symbol} BUY at {price} | SL: {pos['sl']}")
-
-    # ===== SELL =====
-    elif action == "sell":
-
-        # Close long
-        if pos["position"] == "BUY":
-            pnl = price - pos["entry_price"]
-
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-
-            trade_log.append(f"{symbol} EXIT BUY at {price} | PnL: {pnl}")
-
-        # Open short
-        pos["position"] = "SELL"
-        pos["entry_price"] = price
-        pos["sl"] = price * (1 + sl_percent)
-        pos["last_trade_time"] = now
-
-        trade_log.append(f"{symbol} SELL at {price} | SL: {pos['sl']}")
-
-    # ===== TRAILING STOP =====
-    if pos["position"] == "BUY":
-        new_sl = price * (1 - sl_percent)
-
-        if new_sl > pos["sl"]:
-            pos["sl"] = new_sl
-
-        if price <= pos["sl"]:
-            pnl = price - pos["entry_price"]
-
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-
-            trade_log.append(f"{symbol} SL HIT BUY at {price} | PnL: {pnl}")
-            pos["position"] = None
-
-    elif pos["position"] == "SELL":
-        new_sl = price * (1 + sl_percent)
-
-        if new_sl < pos["sl"]:
-            pos["sl"] = new_sl
-
-        if price >= pos["sl"]:
-            pnl = pos["entry_price"] - price
-
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-
-            trade_log.append(f"{symbol} SL HIT SELL at {price} | PnL: {pnl}")
-            pos["position"] = None
-
-    return jsonify({
-        "symbol": symbol,
-        "position": pos["position"],
-        "sl": pos["sl"],
-        "wins": wins,
-        "losses": losses
-    })
-
-
-# ===== LOG =====
-@app.route("/log")
-def log():
-    return {
-        "trades": trade_log[-50:],
-        "wins": wins,
-        "losses": losses,
-        "positions": positions
+    active_trades[symbol] = {
+        "signal": signal.lower(),
+        "entry_price": float(price),
+        "position_size": position_size,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit
     }
 
+    print(f"--- TRADE OPENED ---")
+    print(active_trades[symbol])
+    print("--------------------")
+    return True
 
-# ===== RUN =====
-port = int(os.environ.get("PORT", 10000))
-app.run(host="0.0.0.0", port=port)
+# =====================
+# TRAILING STOP-LOSS MANAGEMENT
+# =====================
+def update_trailing_sl(symbol, current_price):
+    trade = active_trades.get(symbol)
+    if not trade:
+        return
+
+    if trade["signal"] == "buy":
+        price_move_pct = (current_price - trade["entry_price"]) / trade["entry_price"]
+        if price_move_pct > 0:
+            new_sl = trade["stop_loss"] + TRAILING_SL_STEP_PCT * (price_move_pct / BASE_STOP_LOSS_PCT) * trade["entry_price"]
+            if new_sl > trade["stop_loss"]:
+                trade["stop_loss"] = new_sl
+    elif trade["signal"] == "sell":
+        price_move_pct = (trade["entry_price"] - current_price) / trade["entry_price"]
+        if price_move_pct > 0:
+            new_sl = trade["stop_loss"] - TRAILING_SL_STEP_PCT * (price_move_pct / BASE_STOP_LOSS_PCT) * trade["entry_price"]
+            if new_sl < trade["stop_loss"]:
+                trade["stop_loss"] = new_sl
+
+# =====================
+# WEBHOOK ENDPOINT
+# =====================
+@app.route("/", methods=["GET"])
+def home():
+    return "LuxAlgo Multi-Instrument Bot Running 24/7!"
+
+@app.route("/", methods=["POST"])
+def webhook():
+    try:
+        data = request.json
+        symbol = data.get("symbol")
+        signal = data.get("signal")
+        price = float(data.get("price"))
+
+        if not all([symbol, signal, price]):
+            return jsonify({"status": "error", "message": "Missing fields"}), 400
+
+        # Execute the trade
+        success = execute_trade(symbol, signal, price)
+        return jsonify({"status": "success" if success else "error", "trade": active_trades.get(symbol)})
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# =====================
+# TRADE MANAGEMENT LOOP
+# =====================
+def manage_trades():
+    while True:
+        for symbol, trade in list(active_trades.items()):
+            # Replace this with real-time price feed from broker API
+            current_price = trade["entry_price"]  # placeholder
+            
+            # Update trailing stop-loss
+            update_trailing_sl(symbol, current_price)
+
+            # Check stop-loss or take-profit hit
+            if trade["signal"] == "buy":
+                if current_price <= trade["stop_loss"] or current_price >= trade["take_profit"]:
+                    print(f"Closing trade {symbol}")
+                    del active_trades[symbol]
+            elif trade["signal"] == "sell":
+                if current_price >= trade["stop_loss"] or current_price <= trade["take_profit"]:
+                    print(f"Closing trade {symbol}")
+                    del active_trades[symbol]
+        time.sleep(5)  # loop every 5 seconds
+
+# =====================
+# RUN BOT
+# =====================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    Thread(target=manage_trades, daemon=True).start()
+    app.run(host="0.0.0.0", port=port)
