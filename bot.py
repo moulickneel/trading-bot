@@ -9,8 +9,8 @@ ACCOUNT_BALANCE = 10000
 RISK_PERCENT = 1
 RR_RATIO = 2
 BUFFER_PERCENT = 0.1
-MIN_RR = 1.2   # relaxed RR for flexibility
 LOG_FILE = "trade_log.csv"
+MAX_OPEN_TRADES = 1
 # ----------------------------
 
 bias_map = {}
@@ -27,7 +27,7 @@ def log_trade(trade):
             writer.writeheader()
         writer.writerow(trade)
 
-# ----------------- PRICE HISTORY -----------------
+# ----------------- PRICE -----------------
 
 def update_price(symbol, price):
     if symbol not in price_history:
@@ -36,13 +36,13 @@ def update_price(symbol, price):
     if len(price_history[symbol]) > 50:
         price_history[symbol].pop(0)
 
-def get_range(symbol):
+def get_recent_high_low(symbol):
     prices = price_history.get(symbol, [])
     if len(prices) < 10:
         return None, None
     return min(prices[-10:]), max(prices[-10:])
 
-# ----------------- LIQUIDITY -----------------
+# ----------------- SMART LOGIC -----------------
 
 def detect_sweep(symbol, direction):
     prices = price_history.get(symbol, [])
@@ -52,19 +52,10 @@ def detect_sweep(symbol, direction):
     recent = prices[-8:]
     prev = recent[:-2]
 
-    swing_low = min(prev)
-    swing_high = max(prev)
-    last = recent[-1]
-
     if direction == "buy":
-        return min(recent) < swing_low and last > swing_low
-
-    if direction == "sell":
-        return max(recent) > swing_high and last < swing_high
-
-    return False
-
-# ----------------- MOMENTUM (NEW) -----------------
+        return min(recent) < min(prev) and recent[-1] > min(prev)
+    else:
+        return max(recent) > max(prev) and recent[-1] < max(prev)
 
 def detect_momentum(symbol, direction):
     prices = price_history.get(symbol, [])
@@ -75,34 +66,84 @@ def detect_momentum(symbol, direction):
     prev = prices[-2]
 
     move = abs(last - prev)
-    threshold = last * 0.001   # 0.1% move
+    threshold = last * 0.001
 
     if move < threshold:
         return False
 
-    if direction == "buy" and last > prev:
-        return True
+    return (last > prev) if direction == "buy" else (last < prev)
 
-    if direction == "sell" and last < prev:
-        return True
+def micro_trend(symbol):
+    prices = price_history.get(symbol, [])
+    if len(prices) < 6:
+        return None
 
-    return False
+    if prices[-1] > prices[-2] > prices[-3]:
+        return "up"
+    if prices[-1] < prices[-2] < prices[-3]:
+        return "down"
+    return "range"
 
-# ----------------- PREMIUM / DISCOUNT -----------------
+def strong_trend(symbol, direction):
+    prices = price_history.get(symbol, [])
+    if len(prices) < 8:
+        return False
 
-def in_discount(symbol, price):
-    low, high = get_range(symbol)
+    seq = prices[-5:]
+    return all(x < y for x, y in zip(seq, seq[1:])) if direction == "buy" else all(x > y for x, y in zip(seq, seq[1:]))
+
+def is_fake_breakout(symbol, direction):
+    prices = price_history.get(symbol, [])
+    if len(prices) < 6:
+        return False
+
+    if direction == "buy":
+        return prices[-1] > prices[-2] and prices[-2] < prices[-3]
+    else:
+        return prices[-1] < prices[-2] and prices[-2] > prices[-3]
+
+def avoid_top_bottom(symbol, direction):
+    low, high = get_recent_high_low(symbol)
     if low is None:
         return False
-    return price < (low + high) / 2
 
-def in_premium(symbol, price):
-    low, high = get_range(symbol)
-    if low is None:
-        return False
-    return price > (low + high) / 2
+    price = price_history[symbol][-1]
+    mid = (low + high) / 2
 
-# ----------------- SL -----------------
+    return price < mid if direction == "buy" else price > mid
+
+# ----------------- ENTRY ENGINE -----------------
+
+def auto_entry(symbol):
+
+    if symbol not in bias_map:
+        return None
+
+    direction = bias_map[symbol]
+
+    if not avoid_top_bottom(symbol, direction):
+        return None
+
+    if is_fake_breakout(symbol, direction):
+        return None
+
+    sweep = detect_sweep(symbol, direction)
+    momentum = detect_momentum(symbol, direction)
+    trend = strong_trend(symbol, direction)
+    micro = micro_trend(symbol)
+
+    if sweep:
+        return direction, "pullback"
+
+    if trend and micro == ("up" if direction == "buy" else "down"):
+        return direction, "trend_continuation"
+
+    if momentum:
+        return direction, "momentum"
+
+    return None
+
+# ----------------- SL/TP -----------------
 
 def calculate_sl(symbol, direction, entry):
     prices = price_history.get(symbol, [])
@@ -112,12 +153,7 @@ def calculate_sl(symbol, direction, entry):
     recent = prices[-10:]
     buffer = entry * (BUFFER_PERCENT / 100)
 
-    if direction == "buy":
-        return min(recent) - buffer
-    else:
-        return max(recent) + buffer
-
-# ----------------- POSITION SIZE -----------------
+    return min(recent) - buffer if direction == "buy" else max(recent) + buffer
 
 def calculate_size(symbol, entry, sl):
     risk_amt = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
@@ -127,30 +163,25 @@ def calculate_size(symbol, entry, sl):
         return None
 
     units = risk_amt / dist
-
-    if "USD" in symbol:
-        return round(units / 100000, 3)
-
-    return round(units, 3)
+    return round(units / 100000, 3) if "USD" in symbol else round(units, 3)
 
 # ----------------- TRADE -----------------
 
-def open_trade(symbol, direction, entry, zone, entry_type):
+def open_trade(symbol, direction, entry, entry_type):
+
+    if any(t for t in active_trades if t["symbol"] == symbol and t["status"] == "open"):
+        return None
 
     sl = calculate_sl(symbol, direction, entry)
-    if sl is None:
-        return None, "No SL"
+    if not sl:
+        return None
 
     size = calculate_size(symbol, entry, sl)
     if not size:
-        return None, "Invalid size"
+        return None
 
     risk = abs(entry - sl)
     tp = entry + risk * RR_RATIO if direction == "buy" else entry - risk * RR_RATIO
-
-    rr = abs(tp - entry) / risk
-    if rr < MIN_RR:
-        return None, "RR too low"
 
     trade = {
         "symbol": symbol,
@@ -159,17 +190,19 @@ def open_trade(symbol, direction, entry, zone, entry_type):
         "sl": sl,
         "tp": tp,
         "size": size,
-        "zone": zone,
         "entry_type": entry_type,
         "status": "open",
         "entry_time": str(datetime.now()),
         "exit": None,
-        "exit_time": None
+        "exit_time": None,
+        "partial_closed": False,
+        "breakeven_done": False,
+        "trail_active": False
     }
 
     active_trades.append(trade)
     print("OPEN →", trade)
-    return trade, None
+    return trade
 
 def close_trade(trade, price, reason):
     trade["status"] = "closed"
@@ -183,13 +216,45 @@ def manage_trade(trade, price):
     if trade["status"] != "open":
         return
 
-    if trade["direction"] == "buy":
+    entry = trade["entry"]
+    sl = trade["sl"]
+    direction = trade["direction"]
+    risk = abs(entry - sl)
+
+    move = (price - entry) if direction == "buy" else (entry - price)
+    rr = move / risk if risk else 0
+
+    # Breakeven
+    if rr >= 1 and not trade["breakeven_done"]:
+        trade["sl"] = entry
+        trade["breakeven_done"] = True
+        print("BE SET")
+
+    # Partial
+    if rr >= 1.5 and not trade["partial_closed"]:
+        trade["partial_closed"] = True
+        print("PARTIAL CLOSED")
+
+    # Trailing
+    if rr >= 2:
+        trade["trail_active"] = True
+
+    if trade["trail_active"]:
+        prices = price_history.get(trade["symbol"], [])
+        if len(prices) >= 5:
+            if direction == "buy":
+                trade["sl"] = max(trade["sl"], min(prices[-5:]))
+            else:
+                trade["sl"] = min(trade["sl"], max(prices[-5:]))
+
+    # Exit
+    if direction == "buy":
         if price >= trade["tp"]:
             close_trade(trade, price, "TP")
         elif price <= trade["sl"]:
             close_trade(trade, price, "SL")
 
-    elif trade["direction"] == "sell":
+    else:
         if price <= trade["tp"]:
             close_trade(trade, price, "TP")
         elif price >= trade["sl"]:
@@ -200,7 +265,7 @@ def manage_trade(trade, price):
 @app.route("/")
 def home():
     return jsonify({
-        "status": "Flexible SMC Bot Running",
+        "status": "Institutional SMC Bot Running",
         "bias": bias_map,
         "open_trades": len([t for t in active_trades if t["status"] == "open"])
     })
@@ -212,7 +277,6 @@ def webhook():
     symbol = data.get("symbol")
     signal = (data.get("signal") or "").lower()
     price = data.get("price")
-    zone = data.get("zone")
     timeframe = data.get("timeframe")
 
     if not symbol or not signal or price is None or not timeframe:
@@ -222,44 +286,13 @@ def webhook():
 
     direction = "buy" if "bullish" in signal else "sell"
 
-    # HTF BIAS
     if timeframe == "HTF":
         if "choch" in signal or "bos" in signal:
             bias_map[symbol] = direction
+            print(f"BIAS → {symbol}: {direction}")
             return jsonify({"status": "bias updated"})
 
-    # LTF ENTRY
-    if timeframe == "LTF":
-        if "fvg" in signal or "ob breakout" in signal:
-
-            if symbol not in bias_map:
-                return jsonify({"status": "ignored", "reason": "no bias"})
-
-            if bias_map[symbol] != direction:
-                return jsonify({"status": "ignored", "reason": "against bias"})
-
-            sweep = detect_sweep(symbol, direction)
-            momentum = detect_momentum(symbol, direction)
-
-            if not (sweep or momentum):
-                return jsonify({"status": "ignored", "reason": "no entry condition"})
-
-            if direction == "buy" and not (in_discount(symbol, price) or momentum):
-                return jsonify({"status": "ignored", "reason": "bad zone"})
-
-            if direction == "sell" and not (in_premium(symbol, price) or momentum):
-                return jsonify({"status": "ignored", "reason": "bad zone"})
-
-            entry_type = "pullback" if sweep else "momentum"
-
-            trade, err = open_trade(symbol, direction, price, zone, entry_type)
-
-            if err:
-                return jsonify({"status": "rejected", "reason": err})
-
-            return jsonify({"status": "executed", "type": entry_type, "trade": trade})
-
-    return jsonify({"status": "ignored"})
+    return jsonify({"status": "ok"})
 
 @app.route("/update_price", methods=["POST"])
 def update_price_route():
@@ -272,65 +305,23 @@ def update_price_route():
     for trade in active_trades:
         manage_trade(trade, price)
 
+    entry = auto_entry(symbol)
+    if entry:
+        direction, entry_type = entry
+        trade = open_trade(symbol, direction, price, entry_type)
+        if trade:
+            print("AUTO TRADE →", trade)
+
     return jsonify({"status": "updated"})
 
 @app.route("/dashboard")
 def dashboard():
-
-    total = len(active_trades)
-    closed = [t for t in active_trades if t["status"] == "closed"]
-    open_trades = [t for t in active_trades if t["status"] == "open"]
-
-    wins = 0
-    total_pnl = 0
-
-    for t in closed:
-        if t["direction"] == "buy":
-            pnl = (t["exit"] - t["entry"]) * t["size"]
-        else:
-            pnl = (t["entry"] - t["exit"]) * t["size"]
-
-        total_pnl += pnl
-        if pnl > 0:
-            wins += 1
-
-    win_rate = (wins / len(closed) * 100) if closed else 0
-
-    html = f"""
-    <html>
-    <head>
-        <meta http-equiv="refresh" content="10">
-        <style>
-            body {{ background:#111; color:#eee; font-family:Arial; }}
-            table {{ width:100%; border-collapse:collapse; }}
-            th, td {{ padding:8px; border:1px solid #444; text-align:center; }}
-            .win {{ color:lime; }}
-            .loss {{ color:red; }}
-        </style>
-    </head>
-    <body>
-
-    <h2>📊 Trading Dashboard</h2>
-    <p>Total: {total} | Open: {len(open_trades)} | Closed: {len(closed)} | Win Rate: {win_rate:.2f}% | PnL: {total_pnl:.2f}</p>
-
-    <table>
-    <tr><th>Symbol</th><th>Type</th><th>Dir</th><th>Entry</th><th>Exit</th><th>SL</th><th>TP</th><th>PnL</th></tr>
-    """
+    html = "<html><body style='background:#111;color:#eee;font-family:sans-serif'>"
+    html += "<h2>SMC Bot Dashboard</h2><table border=1 cellpadding=5>"
+    html += "<tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Status</th></tr>"
 
     for t in active_trades:
-        pnl = ""
-        cls = ""
-
-        if t["status"] == "closed":
-            if t["direction"] == "buy":
-                val = (t["exit"] - t["entry"]) * t["size"]
-            else:
-                val = (t["entry"] - t["exit"]) * t["size"]
-
-            pnl = f"{val:.2f}"
-            cls = "win" if val > 0 else "loss"
-
-        html += f"<tr class='{cls}'><td>{t['symbol']}</td><td>{t.get('entry_type','')}</td><td>{t['direction']}</td><td>{t['entry']}</td><td>{t.get('exit','')}</td><td>{t['sl']}</td><td>{t['tp']}</td><td>{pnl}</td></tr>"
+        html += f"<tr><td>{t['symbol']}</td><td>{t['direction']}</td><td>{t['entry']}</td><td>{t['sl']}</td><td>{t['tp']}</td><td>{t['status']}</td></tr>"
 
     html += "</table></body></html>"
     return html
