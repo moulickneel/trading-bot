@@ -1,140 +1,82 @@
 from flask import Flask, request, jsonify, render_template_string
-import time
-import os
+import time, os
 
 app = Flask(__name__)
-
-print("🔥 PRO BOT WITH ANALYTICS LOADED 🔥", flush=True)
 
 # =========================
 # STATE
 # =========================
 bias = {}
-last_signal = {}
 price_store = {}
 current_trade = None
 last_trade_time = 0
-
 trade_history = []
 
-# =========================
-# CONFIG
-# =========================
-COOLDOWN = 60
-RR = 2
+COOLDOWN = 10
 
-# =========================
-# LOG STORAGE
-# =========================
 log_buffer = []
-MAX_LOGS = 200
 
 def log(msg):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
-
     log_buffer.append(entry)
-    if len(log_buffer) > MAX_LOGS:
+    if len(log_buffer) > 100:
         log_buffer.pop(0)
 
-# =========================
-# HELPERS
-# =========================
-
-def strong_momentum(price, prev):
-    if prev is None:
-        return False
-    return abs(price - prev) > price * 0.001
-
-def get_trend(price, prev):
-    if prev is None:
-        return None
-    if price > prev:
-        return "up"
-    if price < prev:
-        return "down"
-    return None
-
-def calculate_stats():
+def stats():
     total = len(trade_history)
     wins = sum(1 for t in trade_history if t["result"] == "win")
-    losses = sum(1 for t in trade_history if t["result"] == "loss")
-
-    winrate = (wins / total * 100) if total > 0 else 0
-
-    return total, wins, losses, round(winrate, 2)
-
-# =========================
-# ROUTES
-# =========================
+    losses = total - wins
+    pnl = sum(t["pnl"] for t in trade_history)
+    winrate = (wins/total*100) if total else 0
+    return total, wins, losses, round(winrate,2), round(pnl,2)
 
 @app.route('/')
 def home():
-    return {
-        "status": "BOT RUNNING",
-        "bias": bias,
-        "trade": current_trade
-    }
+    return {"status":"running","trade":current_trade}
 
-# =========================
-# DASHBOARD UI
-# =========================
-
+# ================= DASHBOARD =================
 HTML = """
-<!DOCTYPE html>
 <html>
 <head>
-<title>Trading Bot Pro Dashboard</title>
-<meta http-equiv="refresh" content="3">
+<meta http-equiv="refresh" content="2">
 <style>
-body { font-family: Arial; background:#0f172a; color:#e2e8f0; }
-.box { padding:15px; margin:10px; border-radius:10px; background:#1e293b; }
-.title { font-size:18px; margin-bottom:10px; }
-.log { font-family:monospace; font-size:12px; }
-table { width:100%; border-collapse:collapse; }
-td, th { padding:6px; border-bottom:1px solid #334155; }
-.win { color:#22c55e; }
-.loss { color:#ef4444; }
+body { background:#0f172a; color:white; font-family:Arial }
+.box { padding:15px; margin:10px; background:#1e293b; border-radius:10px }
+.win { color:#22c55e }
+.loss { color:#ef4444 }
 </style>
 </head>
+
 <body>
 
 <div class="box">
-<div class="title">📊 Status</div>
-Bias: {{bias}}<br>
+<h3>📊 Status</h3>
+Bias: {{bias}} <br>
 Active Trade: {{trade}}
 </div>
 
 <div class="box">
-<div class="title">📈 Performance</div>
-Total Trades: {{total}}<br>
-Wins: {{wins}}<br>
-Losses: {{losses}}<br>
-Win Rate: {{winrate}}%
+<h3>📈 Performance</h3>
+Trades: {{t}} | Wins: {{w}} | Losses: {{l}} <br>
+Winrate: {{wr}}% <br>
+Net PnL (R): {{pnl}}
 </div>
 
 <div class="box">
-<div class="title">📜 Trade History</div>
-<table>
-<tr><th>Time</th><th>Side</th><th>Entry</th><th>Result</th></tr>
-{% for t in history %}
-<tr>
-<td>{{t.time}}</td>
-<td>{{t.side}}</td>
-<td>{{t.entry}}</td>
-<td class="{{t.result}}">{{t.result}}</td>
-</tr>
+<h3>📜 Trades</h3>
+{% for t in hist %}
+<div class="{{t.result}}">
+{{t.time}} | {{t.side}} | {{t.result}} | {{t.pnl}}R
+</div>
 {% endfor %}
-</table>
 </div>
 
 <div class="box">
-<div class="title">🧾 Logs</div>
-<div class="log">
+<h3>🧾 Activity</h3>
 {% for l in logs %}
 {{l}}<br>
 {% endfor %}
-</div>
 </div>
 
 </body>
@@ -142,141 +84,135 @@ Win Rate: {{winrate}}%
 """
 
 @app.route('/dashboard')
-def dashboard():
-    total, wins, losses, winrate = calculate_stats()
-
+def dash():
+    t,w,l,wr,pnl = stats()
     return render_template_string(
         HTML,
         bias=bias,
         trade=current_trade,
+        hist=reversed(trade_history[-20:]),
         logs=reversed(log_buffer),
-        history=reversed(trade_history[-20:]),
-        total=total,
-        wins=wins,
-        losses=losses,
-        winrate=winrate
+        t=t,w=w,l=l,wr=wr,pnl=pnl
     )
 
-# =========================
-# WEBHOOK
-# =========================
-
+# ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    global bias, last_signal
-
     data = request.json or {}
-    log(f"📩 Webhook: {data}")
-
     symbol = data.get("symbol")
-    signal = str(data.get("signal", "")).lower()
-    trend = str(data.get("trend", "")).lower()
-    timeframe = data.get("timeframe")
+    trend = str(data.get("trend","")).lower()
+    tf = data.get("timeframe")
 
-    if timeframe == "HTF":
-        if "bullish" in signal or trend == "bullish":
+    if tf == "HTF":
+        if "bullish" in trend:
             bias[symbol] = "buy"
-            log(f"🎯 Bias BUY set")
-        elif "bearish" in signal or trend == "bearish":
+            log(f"Bias BUY {symbol}")
+        elif "bearish" in trend:
             bias[symbol] = "sell"
-            log(f"🎯 Bias SELL set")
+            log(f"Bias SELL {symbol}")
 
-    if timeframe == "LTF":
-        last_signal[symbol] = signal
+    return {"ok":True}
 
-    return {"ok": True}
-
-# =========================
-# PRICE UPDATE
-# =========================
-
+# ================= PRICE =================
 @app.route('/update_price', methods=['POST'])
-def update_price():
+def update():
     global current_trade, last_trade_time
 
     data = request.json or {}
-
     symbol = data.get("symbol")
-    price = data.get("price")
-
-    if symbol is None or price is None:
-        return {"error": "bad data"}, 400
-
-    price = float(price)
+    price = float(data.get("price"))
 
     prev = price_store.get(symbol)
     price_store[symbol] = price
 
-    log(f"{symbol} @ {price}")
+    if not prev:
+        return {"ok":True}
 
     htf = bias.get(symbol)
-    momentum = strong_momentum(price, prev)
-    trend = get_trend(price, prev)
+
+    move = abs(price - prev)
+    momentum = move > price * 0.0004
+    trend = "up" if price > prev else "down"
 
     now = time.time()
 
-    if current_trade is None and htf:
+    # ENTRY
+    if not current_trade and htf:
 
         if now - last_trade_time < COOLDOWN:
-            return {"status": "cooldown"}
+            return {"cooldown":True}
 
         decision = None
 
+        # Momentum entry
         if momentum:
-            if htf == "buy" and trend != "down":
-                decision = "buy"
-            elif htf == "sell" and trend != "up":
-                decision = "sell"
+            if htf=="buy" and trend=="up":
+                decision="buy"
+            elif htf=="sell" and trend=="down":
+                decision="sell"
+
+        # Micro pullback entry
+        if not decision:
+            if htf=="buy" and trend=="up":
+                decision="buy"
+                log("📈 Pullback BUY")
+            elif htf=="sell" and trend=="down":
+                decision="sell"
+                log("📉 Pullback SELL")
 
         if decision:
-            sl = price * 0.995 if decision == "buy" else price * 1.005
-            tp = price + (price - sl) * RR if decision == "buy" else price - (sl - price) * RR
+            risk = move * 2 if move else price * 0.002
+
+            sl = price - risk if decision=="buy" else price + risk
+            tp = price + risk*2 if decision=="buy" else price - risk*2
 
             current_trade = {
-                "symbol": symbol,
-                "side": decision,
-                "entry": price,
-                "sl": sl,
-                "tp": tp,
-                "time": time.strftime('%H:%M:%S')
+                "side":decision,
+                "entry":price,
+                "sl":sl,
+                "tp":tp,
+                "risk":risk,
+                "time":time.strftime('%H:%M:%S')
             }
 
             last_trade_time = now
             log(f"🚀 {decision.upper()} @ {price}")
 
+    else:
+        if htf:
+            log(f"Watching {htf.upper()}...")
+
+    # EXIT
     if current_trade:
         side = current_trade["side"]
         sl = current_trade["sl"]
         tp = current_trade["tp"]
 
-        result = None
+        result=None
+        pnl=0
 
-        if side == "buy":
+        if side=="buy":
             if price <= sl:
-                result = "loss"
+                result="loss"; pnl=-1
             elif price >= tp:
-                result = "win"
+                result="win"; pnl=2
 
-        if side == "sell":
+        if side=="sell":
             if price >= sl:
-                result = "loss"
+                result="loss"; pnl=-1
             elif price <= tp:
-                result = "win"
+                result="win"; pnl=2
 
         if result:
-            current_trade["result"] = result
+            current_trade["result"]=result
+            current_trade["pnl"]=pnl
             trade_history.append(current_trade)
 
-            log(f"{result.upper()} TRADE")
+            log(f"{result.upper()} {pnl}R")
 
-            current_trade = None
+            current_trade=None
 
-    return {"ok": True}
-
-# =========================
-# RUN
-# =========================
+    return {"ok":True}
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
