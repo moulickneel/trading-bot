@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify, render_template_string
-import time, os, threading, websocket, json
+import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 FINAL LIVE BTC BOT STARTED 🔥", flush=True)
+print("🔥 BTC BOT (REST MODE) STARTED 🔥", flush=True)
 
 # =========================
 # STATE
@@ -51,7 +51,7 @@ def on_price_update(price):
     prev = price_store.get(symbol)
     price_store[symbol] = price
 
-    # 🔥 PRICE LOG (VERY IMPORTANT)
+    # 🔥 PRICE LOG
     log(f"📡 BTC Price: {price}")
 
     if not prev:
@@ -89,7 +89,7 @@ def on_price_update(price):
                 decision = "sell"
                 log("📉 Pullback SELL")
 
-        # LTF boost (NOT blocking)
+        # LTF boost
         if ltf_zones:
             recent = ltf_zones[-1]["type"]
             if decision == "buy" and "bullish" in recent:
@@ -146,35 +146,23 @@ def on_price_update(price):
             current_trade = None
 
 # =========================
-# BINANCE LIVE FEED
+# PRICE LOOP (REST API)
 # =========================
-def start_ws():
-    def on_message(ws, message):
-        data = json.loads(message)
-        price = float(data['p'])
-        on_price_update(price)
+def price_loop():
+    while True:
+        try:
+            url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+            res = requests.get(url, timeout=5).json()
+            price = float(res["price"])
 
-    def on_open(ws):
-        log("✅ Connected to Binance WebSocket")
+            on_price_update(price)
 
-    def on_error(ws, error):
-        log(f"❌ WebSocket Error: {error}")
+        except Exception as e:
+            log(f"❌ API Error: {e}")
 
-    def on_close(ws, a, b):
-        log("⚠️ WebSocket Closed. Reconnecting...")
-        time.sleep(2)
-        start_ws()
+        time.sleep(1)
 
-    ws = websocket.WebSocketApp(
-        "wss://stream.binance.com:9443/ws/btcusdt@trade",
-        on_message=on_message,
-        on_open=on_open,
-        on_error=on_error,
-        on_close=on_close
-    )
-    ws.run_forever()
-
-threading.Thread(target=start_ws, daemon=True).start()
+threading.Thread(target=price_loop, daemon=True).start()
 
 # =========================
 # WEBHOOK (HTF + LTF)
@@ -226,7 +214,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h2>BTC LIVE BOT</h2>
+<h2>BTC LIVE BOT (REST)</h2>
 
 <p><b>Bias:</b> {{bias}}</p>
 <p><b>Active Trade:</b> {{trade}}</p>
@@ -261,7 +249,7 @@ def dash():
 
 @app.route('/')
 def home():
-    return {"status": "LIVE BTC BOT RUNNING"}
+    return {"status": "BTC BOT RUNNING (REST MODE)"}
 
 # =========================
 # RUN
