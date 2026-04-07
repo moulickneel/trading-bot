@@ -3,12 +3,12 @@ import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC BOT (REST MODE) STARTED 🔥", flush=True)
+print("🔥 BTC BOT (COINBASE MODE) STARTED 🔥", flush=True)
 
 # =========================
 # STATE
 # =========================
-symbol = "BTCUSDT"
+symbol = "BTCUSD"
 
 bias = {}
 ltf_zones = []
@@ -146,14 +146,15 @@ def on_price_update(price):
             current_trade = None
 
 # =========================
-# PRICE LOOP (REST API)
+# PRICE LOOP (COINBASE API)
 # =========================
 def price_loop():
     while True:
         try:
-            url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+            url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
             res = requests.get(url, timeout=5).json()
-            price = float(res["price"])
+
+            price = float(res["data"]["amount"])
 
             on_price_update(price)
 
@@ -214,7 +215,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h2>BTC LIVE BOT (REST)</h2>
+<h2>BTC LIVE BOT (COINBASE)</h2>
 
 <p><b>Bias:</b> {{bias}}</p>
 <p><b>Active Trade:</b> {{trade}}</p>
@@ -249,7 +250,7 @@ def dash():
 
 @app.route('/')
 def home():
-    return {"status": "BTC BOT RUNNING (REST MODE)"}
+    return {"status": "BTC BOT RUNNING (COINBASE MODE)"}
 
 # =========================
 # RUN
