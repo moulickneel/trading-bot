@@ -1,13 +1,19 @@
 from flask import Flask, request, jsonify, render_template_string
-import time, os
+import time, os, threading, websocket, json
 
 app = Flask(__name__)
+
+print("🔥 FINAL LIVE BTC BOT STARTED 🔥", flush=True)
 
 # =========================
 # STATE
 # =========================
+symbol = "BTCUSDT"
+
 bias = {}
+ltf_zones = []
 price_store = {}
+
 current_trade = None
 last_trade_time = 0
 trade_history = []
@@ -16,6 +22,9 @@ COOLDOWN = 10
 
 log_buffer = []
 
+# =========================
+# LOG
+# =========================
 def log(msg):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
@@ -23,61 +32,203 @@ def log(msg):
     if len(log_buffer) > 100:
         log_buffer.pop(0)
 
+# =========================
+# STATS
+# =========================
 def stats():
     total = len(trade_history)
     wins = sum(1 for t in trade_history if t["result"] == "win")
-    losses = total - wins
     pnl = sum(t["pnl"] for t in trade_history)
-    winrate = (wins/total*100) if total else 0
-    return total, wins, losses, round(winrate,2), round(pnl,2)
+    winrate = (wins / total * 100) if total else 0
+    return total, wins, total-wins, round(winrate,2), round(pnl,2)
 
-@app.route('/')
-def home():
-    return {"status":"running","trade":current_trade}
+# =========================
+# STRATEGY CORE
+# =========================
+def on_price_update(price):
+    global current_trade, last_trade_time
 
-# ================= DASHBOARD =================
+    prev = price_store.get(symbol)
+    price_store[symbol] = price
+
+    if not prev:
+        return
+
+    htf = bias.get(symbol)
+    move = abs(price - prev)
+    momentum = move > price * 0.0004
+    trend = "up" if price > prev else "down"
+
+    now = time.time()
+
+    # ================= ENTRY =================
+    if not current_trade and htf:
+
+        if now - last_trade_time < COOLDOWN:
+            return
+
+        decision = None
+        confidence = "LOW"
+
+        # Momentum entry
+        if momentum:
+            if htf == "buy" and trend == "up":
+                decision = "buy"
+            elif htf == "sell" and trend == "down":
+                decision = "sell"
+
+        # LTF zone boost (NOT blocking)
+        recent_ltf = None
+        if ltf_zones:
+            recent_ltf = ltf_zones[-1]["type"]
+
+        if not decision:
+            if htf == "buy" and trend == "up":
+                decision = "buy"
+                log("📈 Pullback BUY")
+            elif htf == "sell" and trend == "down":
+                decision = "sell"
+                log("📉 Pullback SELL")
+
+        if decision:
+            # Confidence boost
+            if recent_ltf:
+                if decision == "buy" and "bullish" in recent_ltf:
+                    confidence = "HIGH"
+                elif decision == "sell" and "bearish" in recent_ltf:
+                    confidence = "HIGH"
+
+            risk = move * 2 if move else price * 0.002
+
+            sl = price - risk if decision == "buy" else price + risk
+            tp = price + risk*2 if decision == "buy" else price - risk*2
+
+            current_trade = {
+                "side": decision,
+                "entry": price,
+                "sl": sl,
+                "tp": tp,
+                "confidence": confidence,
+                "time": time.strftime('%H:%M:%S')
+            }
+
+            last_trade_time = now
+            log(f"🚀 {decision.upper()} @ {price} | {confidence}")
+
+    # ================= EXIT =================
+    if current_trade:
+        side = current_trade["side"]
+        sl = current_trade["sl"]
+        tp = current_trade["tp"]
+
+        result = None
+        pnl = 0
+
+        if side == "buy":
+            if price <= sl:
+                result = "loss"; pnl = -1
+            elif price >= tp:
+                result = "win"; pnl = 2
+
+        if side == "sell":
+            if price >= sl:
+                result = "loss"; pnl = -1
+            elif price <= tp:
+                result = "win"; pnl = 2
+
+        if result:
+            current_trade["result"] = result
+            current_trade["pnl"] = pnl
+            trade_history.append(current_trade)
+
+            log(f"{result.upper()} {pnl}R")
+
+            current_trade = None
+
+# =========================
+# BINANCE LIVE FEED
+# =========================
+def start_ws():
+    def on_message(ws, message):
+        data = json.loads(message)
+        price = float(data['p'])
+        on_price_update(price)
+
+    ws = websocket.WebSocketApp(
+        "wss://stream.binance.com:9443/ws/btcusdt@trade",
+        on_message=on_message
+    )
+    ws.run_forever()
+
+threading.Thread(target=start_ws, daemon=True).start()
+
+# =========================
+# WEBHOOK (HTF + LTF)
+# =========================
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.json or {}
+
+    trend = str(data.get("trend","")).lower()
+    tf = data.get("timeframe")
+    ltf_type = str(data.get("type","")).lower()
+
+    # HTF
+    if tf == "HTF":
+        if "bullish" in trend:
+            bias[symbol] = "buy"
+            log("🎯 HTF BUY")
+        elif "bearish" in trend:
+            bias[symbol] = "sell"
+            log("🎯 HTF SELL")
+
+    # LTF (store, don't block)
+    if tf == "LTF" and ltf_type:
+        ltf_zones.append({
+            "type": ltf_type,
+            "time": time.time()
+        })
+
+        # keep last 20
+        if len(ltf_zones) > 20:
+            ltf_zones.pop(0)
+
+        log(f"📍 LTF: {ltf_type}")
+
+    return {"ok": True}
+
+# =========================
+# IGNORE PRICE ALERTS
+# =========================
+@app.route('/update_price', methods=['POST'])
+def ignore_price():
+    log("⚠️ Ignored TradingView price update")
+    return {"status": "ignored"}
+
+# =========================
+# DASHBOARD
+# =========================
 HTML = """
 <html>
-<head>
-<meta http-equiv="refresh" content="2">
-<style>
-body { background:#0f172a; color:white; font-family:Arial }
-.box { padding:15px; margin:10px; background:#1e293b; border-radius:10px }
-.win { color:#22c55e }
-.loss { color:#ef4444 }
-</style>
-</head>
+<head><meta http-equiv="refresh" content="2"></head>
+<body style="background:#0f172a;color:white;font-family:Arial">
 
-<body>
+<h2>BTC LIVE BOT</h2>
 
-<div class="box">
-<h3>📊 Status</h3>
-Bias: {{bias}} <br>
-Active Trade: {{trade}}
-</div>
+<p><b>Bias:</b> {{bias}}</p>
+<p><b>Active Trade:</b> {{trade}}</p>
 
-<div class="box">
-<h3>📈 Performance</h3>
-Trades: {{t}} | Wins: {{w}} | Losses: {{l}} <br>
-Winrate: {{wr}}% <br>
-Net PnL (R): {{pnl}}
-</div>
+<p><b>Trades:</b> {{t}} | <b>Winrate:</b> {{wr}}% | <b>PnL:</b> {{pnl}}R</p>
 
-<div class="box">
-<h3>📜 Trades</h3>
+<h3>Recent Trades</h3>
 {% for t in hist %}
-<div class="{{t.result}}">
-{{t.time}} | {{t.side}} | {{t.result}} | {{t.pnl}}R
-</div>
+<div>{{t.time}} | {{t.side}} | {{t.result}} | {{t.pnl}}R | {{t.confidence}}</div>
 {% endfor %}
-</div>
 
-<div class="box">
-<h3>🧾 Activity</h3>
+<h3>Logs</h3>
 {% for l in logs %}
-{{l}}<br>
+<div>{{l}}</div>
 {% endfor %}
-</div>
 
 </body>
 </html>
@@ -92,127 +243,15 @@ def dash():
         trade=current_trade,
         hist=reversed(trade_history[-20:]),
         logs=reversed(log_buffer),
-        t=t,w=w,l=l,wr=wr,pnl=pnl
+        t=t, wr=wr, pnl=pnl
     )
 
-# ================= WEBHOOK =================
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.json or {}
-    symbol = data.get("symbol")
-    trend = str(data.get("trend","")).lower()
-    tf = data.get("timeframe")
+@app.route('/')
+def home():
+    return {"status": "LIVE BTC BOT RUNNING"}
 
-    if tf == "HTF":
-        if "bullish" in trend:
-            bias[symbol] = "buy"
-            log(f"Bias BUY {symbol}")
-        elif "bearish" in trend:
-            bias[symbol] = "sell"
-            log(f"Bias SELL {symbol}")
-
-    return {"ok":True}
-
-# ================= PRICE =================
-@app.route('/update_price', methods=['POST'])
-def update():
-    global current_trade, last_trade_time
-
-    data = request.json or {}
-    symbol = data.get("symbol")
-    price = float(data.get("price"))
-
-    prev = price_store.get(symbol)
-    price_store[symbol] = price
-
-    if not prev:
-        return {"ok":True}
-
-    htf = bias.get(symbol)
-
-    move = abs(price - prev)
-    momentum = move > price * 0.0004
-    trend = "up" if price > prev else "down"
-
-    now = time.time()
-
-    # ENTRY
-    if not current_trade and htf:
-
-        if now - last_trade_time < COOLDOWN:
-            return {"cooldown":True}
-
-        decision = None
-
-        # Momentum entry
-        if momentum:
-            if htf=="buy" and trend=="up":
-                decision="buy"
-            elif htf=="sell" and trend=="down":
-                decision="sell"
-
-        # Micro pullback entry
-        if not decision:
-            if htf=="buy" and trend=="up":
-                decision="buy"
-                log("📈 Pullback BUY")
-            elif htf=="sell" and trend=="down":
-                decision="sell"
-                log("📉 Pullback SELL")
-
-        if decision:
-            risk = move * 2 if move else price * 0.002
-
-            sl = price - risk if decision=="buy" else price + risk
-            tp = price + risk*2 if decision=="buy" else price - risk*2
-
-            current_trade = {
-                "side":decision,
-                "entry":price,
-                "sl":sl,
-                "tp":tp,
-                "risk":risk,
-                "time":time.strftime('%H:%M:%S')
-            }
-
-            last_trade_time = now
-            log(f"🚀 {decision.upper()} @ {price}")
-
-    else:
-        if htf:
-            log(f"Watching {htf.upper()}...")
-
-    # EXIT
-    if current_trade:
-        side = current_trade["side"]
-        sl = current_trade["sl"]
-        tp = current_trade["tp"]
-
-        result=None
-        pnl=0
-
-        if side=="buy":
-            if price <= sl:
-                result="loss"; pnl=-1
-            elif price >= tp:
-                result="win"; pnl=2
-
-        if side=="sell":
-            if price >= sl:
-                result="loss"; pnl=-1
-            elif price <= tp:
-                result="win"; pnl=2
-
-        if result:
-            current_trade["result"]=result
-            current_trade["pnl"]=pnl
-            trade_history.append(current_trade)
-
-            log(f"{result.upper()} {pnl}R")
-
-            current_trade=None
-
-    return {"ok":True}
-
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
