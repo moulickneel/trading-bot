@@ -51,6 +51,9 @@ def on_price_update(price):
     prev = price_store.get(symbol)
     price_store[symbol] = price
 
+    # 🔥 PRICE LOG (VERY IMPORTANT)
+    log(f"📡 BTC Price: {price}")
+
     if not prev:
         return
 
@@ -77,11 +80,7 @@ def on_price_update(price):
             elif htf == "sell" and trend == "down":
                 decision = "sell"
 
-        # LTF zone boost (NOT blocking)
-        recent_ltf = None
-        if ltf_zones:
-            recent_ltf = ltf_zones[-1]["type"]
-
+        # Pullback entry
         if not decision:
             if htf == "buy" and trend == "up":
                 decision = "buy"
@@ -90,14 +89,15 @@ def on_price_update(price):
                 decision = "sell"
                 log("📉 Pullback SELL")
 
-        if decision:
-            # Confidence boost
-            if recent_ltf:
-                if decision == "buy" and "bullish" in recent_ltf:
-                    confidence = "HIGH"
-                elif decision == "sell" and "bearish" in recent_ltf:
-                    confidence = "HIGH"
+        # LTF boost (NOT blocking)
+        if ltf_zones:
+            recent = ltf_zones[-1]["type"]
+            if decision == "buy" and "bullish" in recent:
+                confidence = "HIGH"
+            elif decision == "sell" and "bearish" in recent:
+                confidence = "HIGH"
 
+        if decision:
             risk = move * 2 if move else price * 0.002
 
             sl = price - risk if decision == "buy" else price + risk
@@ -154,9 +154,23 @@ def start_ws():
         price = float(data['p'])
         on_price_update(price)
 
+    def on_open(ws):
+        log("✅ Connected to Binance WebSocket")
+
+    def on_error(ws, error):
+        log(f"❌ WebSocket Error: {error}")
+
+    def on_close(ws, a, b):
+        log("⚠️ WebSocket Closed. Reconnecting...")
+        time.sleep(2)
+        start_ws()
+
     ws = websocket.WebSocketApp(
         "wss://stream.binance.com:9443/ws/btcusdt@trade",
-        on_message=on_message
+        on_message=on_message,
+        on_open=on_open,
+        on_error=on_error,
+        on_close=on_close
     )
     ws.run_forever()
 
@@ -182,14 +196,13 @@ def webhook():
             bias[symbol] = "sell"
             log("🎯 HTF SELL")
 
-    # LTF (store, don't block)
+    # LTF
     if tf == "LTF" and ltf_type:
         ltf_zones.append({
             "type": ltf_type,
             "time": time.time()
         })
 
-        # keep last 20
         if len(ltf_zones) > 20:
             ltf_zones.pop(0)
 
