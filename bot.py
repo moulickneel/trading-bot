@@ -7,16 +7,17 @@ app = Flask(__name__)
 # ---------- CONFIG ----------
 ACCOUNT_BALANCE = 10000
 RISK_PERCENT = 1
-RR_RATIO = 2
 BUFFER_PERCENT = 0.1
 LOG_FILE = "trade_log.csv"
-MAX_OPEN_TRADES = 1
+MAX_OPEN_TRADES = 2
+COOLDOWN_SECONDS = 180
 # ----------------------------
 
 bias_map = {}
 price_history = {}
 active_trades = []
 ltf_context = {}
+last_trade_time = {}
 
 # ----------------- LOGGING -----------------
 
@@ -34,7 +35,7 @@ def update_price(symbol, price):
     if symbol not in price_history:
         price_history[symbol] = []
     price_history[symbol].append(price)
-    if len(price_history[symbol]) > 100:
+    if len(price_history[symbol]) > 200:
         price_history[symbol].pop(0)
 
 def get_recent_high_low(symbol):
@@ -51,9 +52,7 @@ def get_volatility(symbol):
         return None
 
     moves = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-    recent = moves[-20:]
-
-    return sum(recent) / len(recent)
+    return sum(moves[-20:]) / 20
 
 # ----------------- MARKET STATE -----------------
 
@@ -66,12 +65,9 @@ def market_state(symbol):
 
     range_size = max(prices[-20:]) - min(prices[-20:])
 
-    if range_size < vol * 5:
-        return "ranging"
+    return "ranging" if range_size < vol * 5 else "trending"
 
-    return "trending"
-
-# ----------------- SMART LOGIC -----------------
+# ----------------- CORE LOGIC -----------------
 
 def detect_sweep(symbol, direction):
     prices = price_history.get(symbol, [])
@@ -87,7 +83,6 @@ def detect_sweep(symbol, direction):
     swing_high = max(lookback[:-3])
     current = prices[-1]
     recent = prices[-3:]
-
     buffer = vol * 0.5
 
     if direction == "buy":
@@ -108,7 +103,6 @@ def detect_momentum(symbol, direction):
         return False
 
     last, prev, prev2 = prices[-1], prices[-2], prices[-3]
-
     move = abs(last - prev)
     threshold = vol * 1.2
     expansion = abs(last - prev) > abs(prev - prev2)
@@ -128,7 +122,6 @@ def strong_trend(symbol, direction):
         return False
 
     moves = [prices[i] - prices[i-1] for i in range(-6, -1)]
-
     strength = sum(m for m in moves if m > 0) if direction == "buy" else sum(abs(m) for m in moves if m < 0)
 
     return strength > (vol * 3)
@@ -143,6 +136,19 @@ def micro_trend(symbol):
     if prices[-1] < prices[-2] < prices[-3]:
         return "down"
     return "range"
+
+def weak_pullback_entry(symbol, direction):
+    prices = price_history.get(symbol, [])
+    if len(prices) < 10:
+        return False
+
+    if direction == "sell":
+        return prices[-1] < prices[-3] and prices[-2] < prices[-4]
+
+    if direction == "buy":
+        return prices[-1] > prices[-3] and prices[-2] > prices[-4]
+
+    return False
 
 def is_fake_breakout(symbol, direction):
     prices = price_history.get(symbol, [])
@@ -180,11 +186,12 @@ def auto_entry(symbol):
     momentum = detect_momentum(symbol, direction)
     trend = strong_trend(symbol, direction)
     micro = micro_trend(symbol)
+    state = market_state(symbol)
 
     context = ltf_context.get(symbol, {})
     pullback_active = context.get("pullback", False)
 
-    state = market_state(symbol)
+    open_positions = [t for t in active_trades if t["symbol"] == symbol and t["status"] == "open"]
 
     # ---- Pullback Mode ----
     if pullback_active:
@@ -192,19 +199,28 @@ def auto_entry(symbol):
             return direction, "pullback_sweep"
         if momentum and micro == ("up" if direction == "buy" else "down"):
             return direction, "pullback_confirmation"
-        return None
 
-    # ---- Trending Market ----
+    # ---- Trending ----
     if state == "trending":
         if trend and micro == ("up" if direction == "buy" else "down"):
             return direction, "trend_continuation"
 
-    # ---- Ranging Market ----
-    if state == "ranging":
-        return None
+        if weak_pullback_entry(symbol, direction):
+            return direction, "weak_pullback"
+
+    # ---- Re-entry ----
+    if open_positions:
+        for t in open_positions:
+            entry = t["entry"]
+            price = price_history[symbol][-1]
+            profit = (price - entry) if t["direction"] == "buy" else (entry - price)
+
+            if profit > abs(entry - t["sl"]):
+                if weak_pullback_entry(symbol, direction):
+                    return direction, "re_entry"
 
     # ---- Fallback ----
-    if momentum:
+    if state != "ranging" and momentum:
         return direction, "momentum"
 
     return None
@@ -217,7 +233,6 @@ def calculate_sl(symbol, direction, entry):
         return None
 
     buffer = entry * (BUFFER_PERCENT / 100)
-
     return min(prices[-20:]) - buffer if direction == "buy" else max(prices[-20:]) + buffer
 
 def calculate_size(symbol, entry, sl):
@@ -228,14 +243,23 @@ def calculate_size(symbol, entry, sl):
         return None
 
     units = risk_amt / dist
-    return round(units / 100000, 3) if "USD" in symbol else round(units, 3)
+    return round(units, 3)
 
 # ----------------- TRADE -----------------
 
 def open_trade(symbol, direction, entry, entry_type):
 
-    if any(t for t in active_trades if t["symbol"] == symbol and t["status"] == "open"):
+    open_positions = [t for t in active_trades if t["symbol"] == symbol and t["status"] == "open"]
+    if len(open_positions) >= MAX_OPEN_TRADES:
         return None
+
+    now = datetime.now()
+    last_time = last_trade_time.get(symbol)
+
+    if last_time and (now - last_time).seconds < COOLDOWN_SECONDS:
+        return None
+
+    last_trade_time[symbol] = now
 
     sl = calculate_sl(symbol, direction, entry)
     if not sl:
@@ -246,7 +270,18 @@ def open_trade(symbol, direction, entry, entry_type):
         return None
 
     risk = abs(entry - sl)
-    tp = entry + risk * RR_RATIO if direction == "buy" else entry - risk * RR_RATIO
+
+    state = market_state(symbol)
+    trend = strong_trend(symbol, direction)
+
+    if state == "trending" and trend:
+        rr = 3
+    elif state == "trending":
+        rr = 2.5
+    else:
+        rr = 1.5
+
+    tp = entry + risk * rr if direction == "buy" else entry - risk * rr
 
     trade = {
         "symbol": symbol,
@@ -293,7 +328,7 @@ def manage_trade(trade, price):
         trade["sl"] = entry
         trade["breakeven_done"] = True
 
-    if rr >= 1.5 and not trade["partial_closed"]:
+    if rr >= 1 and not trade["partial_closed"]:
         trade["partial_closed"] = True
 
     if rr >= 2:
@@ -301,11 +336,15 @@ def manage_trade(trade, price):
 
     if trade["trail_active"]:
         prices = price_history.get(trade["symbol"], [])
-        if len(prices) >= 5:
+        if len(prices) >= 10:
             if direction == "buy":
-                trade["sl"] = max(trade["sl"], min(prices[-5:]))
+                new_sl = min(prices[-10:])
+                if new_sl > trade["sl"]:
+                    trade["sl"] = new_sl
             else:
-                trade["sl"] = min(trade["sl"], max(prices[-5:]))
+                new_sl = max(prices[-10:])
+                if new_sl < trade["sl"]:
+                    trade["sl"] = new_sl
 
     if direction == "buy":
         if price >= trade["tp"]:
@@ -323,7 +362,7 @@ def manage_trade(trade, price):
 @app.route("/")
 def home():
     return jsonify({
-        "status": "Adaptive SMC Bot Running",
+        "status": "FINAL Adaptive Bot Running",
         "bias": bias_map,
         "open_trades": len([t for t in active_trades if t["status"] == "open"])
     })
@@ -348,25 +387,17 @@ def webhook():
         if "choch" in signal or "bos" in signal:
             bias_map[symbol] = direction
             print(f"BIAS → {symbol}: {direction}")
-            return jsonify({"status": "bias updated"})
 
     if timeframe == "LTF":
-
         if symbol not in ltf_context:
-            ltf_context[symbol] = {"pullback": False, "last_signal": None}
+            ltf_context[symbol] = {"pullback": False}
 
         current_bias = bias_map.get(symbol)
-        if not current_bias:
-            return jsonify({"status": "no bias yet"})
 
-        if direction != current_bias:
+        if current_bias and direction != current_bias:
             ltf_context[symbol]["pullback"] = True
-            ltf_context[symbol]["last_signal"] = signal
-            print(f"PULLBACK → {symbol}")
         else:
             ltf_context[symbol]["pullback"] = False
-            ltf_context[symbol]["last_signal"] = signal
-            print(f"CONTINUATION → {symbol}")
 
     return jsonify({"status": "processed"})
 
@@ -393,11 +424,11 @@ def update_price_route():
 @app.route("/dashboard")
 def dashboard():
     html = "<html><body style='background:#111;color:#eee;font-family:sans-serif'>"
-    html += "<h2>Adaptive SMC Bot Dashboard</h2><table border=1 cellpadding=5>"
-    html += "<tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Status</th></tr>"
+    html += "<h2>Adaptive Bot Dashboard</h2><table border=1 cellpadding=5>"
+    html += "<tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Status</th><th>Type</th></tr>"
 
     for t in active_trades:
-        html += f"<tr><td>{t['symbol']}</td><td>{t['direction']}</td><td>{t['entry']}</td><td>{t['sl']}</td><td>{t['tp']}</td><td>{t['status']}</td></tr>"
+        html += f"<tr><td>{t['symbol']}</td><td>{t['direction']}</td><td>{t['entry']}</td><td>{t['sl']}</td><td>{t['tp']}</td><td>{t['status']}</td><td>{t['entry_type']}</td></tr>"
 
     html += "</table></body></html>"
     return html
