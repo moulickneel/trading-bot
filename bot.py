@@ -1,30 +1,24 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, render_template_string
 import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC BOT (COINBASE MODE) STARTED 🔥", flush=True)
+print("🔥 BTC BOT (AGGRESSIVE MODE) STARTED 🔥", flush=True)
 
-# =========================
-# STATE
-# =========================
 symbol = "BTCUSD"
 
 bias = {}
-ltf_zones = []
 price_store = {}
 
 current_trade = None
 last_trade_time = 0
 trade_history = []
 
-COOLDOWN = 10
+COOLDOWN = 5  # faster trading
 
 log_buffer = []
 
-# =========================
-# LOG
-# =========================
+# ================= LOG =================
 def log(msg):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
@@ -32,9 +26,7 @@ def log(msg):
     if len(log_buffer) > 100:
         log_buffer.pop(0)
 
-# =========================
-# STATS
-# =========================
+# ================= STATS =================
 def stats():
     total = len(trade_history)
     wins = sum(1 for t in trade_history if t["result"] == "win")
@@ -42,78 +34,59 @@ def stats():
     winrate = (wins / total * 100) if total else 0
     return total, wins, total-wins, round(winrate,2), round(pnl,2)
 
-# =========================
-# STRATEGY CORE
-# =========================
+# ================= CORE =================
 def on_price_update(price):
     global current_trade, last_trade_time
 
     prev = price_store.get(symbol)
     price_store[symbol] = price
 
-    # 🔥 PRICE LOG
     log(f"📡 BTC Price: {price}")
 
     if not prev:
         return
 
-    htf = bias.get(symbol)
-    move = abs(price - prev)
-    momentum = move > price * 0.0004
-    trend = "up" if price > prev else "down"
+    move = price - prev
+    trend = "up" if move > 0 else "down"
+    momentum = abs(move) > price * 0.00005  # VERY LOW threshold
+
+    htf = bias.get(symbol, "buy")  # 🔥 DEFAULT BUY (no stall)
+
+    log(f"HTF: {htf} | Trend: {trend} | Momentum: {momentum}")
 
     now = time.time()
 
     # ================= ENTRY =================
-    if not current_trade and htf:
-
-        if now - last_trade_time < COOLDOWN:
-            return
+    if not current_trade and (now - last_trade_time > COOLDOWN):
 
         decision = None
-        confidence = "LOW"
 
-        # Momentum entry
+        # Momentum based
         if momentum:
-            if htf == "buy" and trend == "up":
+            if trend == "up":
                 decision = "buy"
-            elif htf == "sell" and trend == "down":
+            else:
                 decision = "sell"
 
-        # Pullback entry
+        # Fallback (force trade)
         if not decision:
-            if htf == "buy" and trend == "up":
-                decision = "buy"
-                log("📈 Pullback BUY")
-            elif htf == "sell" and trend == "down":
-                decision = "sell"
-                log("📉 Pullback SELL")
+            decision = "buy" if trend == "up" else "sell"
 
-        # LTF boost
-        if ltf_zones:
-            recent = ltf_zones[-1]["type"]
-            if decision == "buy" and "bullish" in recent:
-                confidence = "HIGH"
-            elif decision == "sell" and "bearish" in recent:
-                confidence = "HIGH"
+        risk = price * 0.001
 
-        if decision:
-            risk = move * 2 if move else price * 0.002
+        sl = price - risk if decision == "buy" else price + risk
+        tp = price + risk*2 if decision == "buy" else price - risk*2
 
-            sl = price - risk if decision == "buy" else price + risk
-            tp = price + risk*2 if decision == "buy" else price - risk*2
+        current_trade = {
+            "side": decision,
+            "entry": price,
+            "sl": sl,
+            "tp": tp,
+            "time": time.strftime('%H:%M:%S')
+        }
 
-            current_trade = {
-                "side": decision,
-                "entry": price,
-                "sl": sl,
-                "tp": tp,
-                "confidence": confidence,
-                "time": time.strftime('%H:%M:%S')
-            }
-
-            last_trade_time = now
-            log(f"🚀 {decision.upper()} @ {price} | {confidence}")
+        last_trade_time = now
+        log(f"🚀 {decision.upper()} @ {price}")
 
     # ================= EXIT =================
     if current_trade:
@@ -145,15 +118,12 @@ def on_price_update(price):
 
             current_trade = None
 
-# =========================
-# PRICE LOOP (COINBASE API)
-# =========================
+# ================= PRICE LOOP =================
 def price_loop():
     while True:
         try:
             url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
             res = requests.get(url, timeout=5).json()
-
             price = float(res["data"]["amount"])
 
             on_price_update(price)
@@ -165,57 +135,30 @@ def price_loop():
 
 threading.Thread(target=price_loop, daemon=True).start()
 
-# =========================
-# WEBHOOK (HTF + LTF)
-# =========================
+# ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json or {}
 
     trend = str(data.get("trend","")).lower()
-    tf = data.get("timeframe")
-    ltf_type = str(data.get("type","")).lower()
 
-    # HTF
-    if tf == "HTF":
-        if "bullish" in trend:
-            bias[symbol] = "buy"
-            log("🎯 HTF BUY")
-        elif "bearish" in trend:
-            bias[symbol] = "sell"
-            log("🎯 HTF SELL")
+    if "bullish" in trend:
+        bias[symbol] = "buy"
+        log("🎯 HTF BUY")
 
-    # LTF
-    if tf == "LTF" and ltf_type:
-        ltf_zones.append({
-            "type": ltf_type,
-            "time": time.time()
-        })
-
-        if len(ltf_zones) > 20:
-            ltf_zones.pop(0)
-
-        log(f"📍 LTF: {ltf_type}")
+    elif "bearish" in trend:
+        bias[symbol] = "sell"
+        log("🎯 HTF SELL")
 
     return {"ok": True}
 
-# =========================
-# IGNORE PRICE ALERTS
-# =========================
-@app.route('/update_price', methods=['POST'])
-def ignore_price():
-    log("⚠️ Ignored TradingView price update")
-    return {"status": "ignored"}
-
-# =========================
-# DASHBOARD
-# =========================
+# ================= DASHBOARD =================
 HTML = """
 <html>
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h2>BTC LIVE BOT (COINBASE)</h2>
+<h2>BTC BOT (AGGRESSIVE)</h2>
 
 <p><b>Bias:</b> {{bias}}</p>
 <p><b>Active Trade:</b> {{trade}}</p>
@@ -224,7 +167,7 @@ HTML = """
 
 <h3>Recent Trades</h3>
 {% for t in hist %}
-<div>{{t.time}} | {{t.side}} | {{t.result}} | {{t.pnl}}R | {{t.confidence}}</div>
+<div>{{t.time}} | {{t.side}} | {{t.result}} | {{t.pnl}}R</div>
 {% endfor %}
 
 <h3>Logs</h3>
@@ -250,10 +193,8 @@ def dash():
 
 @app.route('/')
 def home():
-    return {"status": "BTC BOT RUNNING (COINBASE MODE)"}
+    return {"status": "AGGRESSIVE BOT RUNNING"}
 
-# =========================
-# RUN
-# =========================
+# ================= RUN =================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
