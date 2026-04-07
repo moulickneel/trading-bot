@@ -1,23 +1,24 @@
 from flask import Flask, request, jsonify
 from datetime import datetime
-import csv, os
+import csv, os, sys
 
 app = Flask(__name__)
+
+print("🔥 NEW BOT VERSION LOADED 🔥")
+sys.stdout.flush()
 
 # ---------- CONFIG ----------
 ACCOUNT_BALANCE = 10000
 RISK_PERCENT = 1
 BUFFER_PERCENT = 0.1
 LOG_FILE = "trade_log.csv"
-MAX_OPEN_TRADES = 2
-COOLDOWN_SECONDS = 180
+COOLDOWN_SECONDS = 60
 DEBUG = True
 # ----------------------------
 
 bias_map = {}
 price_history = {}
 active_trades = []
-ltf_context = {}
 last_trade_time = {}
 
 # ----------------- DEBUG -----------------
@@ -25,16 +26,7 @@ last_trade_time = {}
 def log(msg):
     if DEBUG:
         print(f"[{datetime.now()}] {msg}")
-
-# ----------------- LOGGING -----------------
-
-def log_trade(trade):
-    file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=trade.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(trade)
+        sys.stdout.flush()
 
 # ----------------- PRICE -----------------
 
@@ -42,35 +34,23 @@ def update_price(symbol, price):
     if symbol not in price_history:
         price_history[symbol] = []
     price_history[symbol].append(price)
-    if len(price_history[symbol]) > 200:
+    if len(price_history[symbol]) > 100:
         price_history[symbol].pop(0)
 
 # ----------------- VOLATILITY -----------------
 
 def get_volatility(symbol):
     prices = price_history.get(symbol, [])
-    if len(prices) < 20:
-        return None
+    if len(prices) < 10:
+        return 1
     moves = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-    return sum(moves[-20:]) / 20
-
-# ----------------- MARKET STATE -----------------
-
-def market_state(symbol):
-    prices = price_history.get(symbol, [])
-    vol = get_volatility(symbol)
-
-    if not vol or len(prices) < 20:
-        return "unknown"
-
-    rng = max(prices[-20:]) - min(prices[-20:])
-    return "ranging" if rng < vol * 5 else "trending"
+    return sum(moves[-10:]) / 10
 
 # ----------------- ENTRY LOGIC -----------------
 
 def auto_entry(symbol):
 
-    log(f"\n--- AUTO ENTRY CHECK: {symbol} ---")
+    log(f"--- AUTO ENTRY CHECK: {symbol} ---")
 
     if symbol not in bias_map:
         log("❌ No HTF bias")
@@ -79,48 +59,38 @@ def auto_entry(symbol):
     direction = bias_map[symbol]
     prices = price_history.get(symbol, [])
 
-    if len(prices) < 20:
+    if len(prices) < 10:
         log("❌ Not enough price data")
         return None
 
     price = prices[-1]
-    low = min(prices[-20:])
-    high = max(prices[-20:])
-    mid = (low + high) / 2
+    vol = get_volatility(symbol)
 
     log(f"Bias: {direction}")
-    log(f"Price: {price}, Range: {low}-{high}")
+    log(f"Price: {price}, Volatility: {vol}")
 
-    # Discount/Premium filter
-    if direction == "buy" and price > mid:
-        log("❌ Blocked: Buying in premium")
-        return None
-    if direction == "sell" and price < mid:
-        log("❌ Blocked: Selling in discount")
-        return None
-
-    # Momentum
+    # Simple momentum detection
     last, prev = prices[-1], prices[-2]
-    momentum = abs(last - prev) > get_volatility(symbol)
+    momentum = abs(last - prev) > vol * 0.5
 
     log(f"Momentum: {momentum}")
 
-    # Weak pullback
-    weak_pullback = (
-        prices[-1] > prices[-3] if direction == "buy"
-        else prices[-1] < prices[-3]
-    )
+    # Simple trend direction
+    trend_up = prices[-1] > prices[-2] > prices[-3]
+    trend_down = prices[-1] < prices[-2] < prices[-3]
 
-    log(f"Weak Pullback: {weak_pullback}")
+    log(f"Trend Up: {trend_up}, Trend Down: {trend_down}")
 
-    # Decision
-    if momentum:
-        log("✅ Entry via momentum")
-        return direction, "momentum"
+    # ENTRY CONDITIONS (RELAXED)
+    if direction == "buy":
+        if momentum and trend_up:
+            log("✅ BUY ENTRY TRIGGERED")
+            return "buy", "momentum"
 
-    if weak_pullback:
-        log("✅ Entry via pullback")
-        return direction, "pullback"
+    if direction == "sell":
+        if momentum and trend_down:
+            log("✅ SELL ENTRY TRIGGERED")
+            return "sell", "momentum"
 
     log("❌ No valid entry condition")
     return None
@@ -129,15 +99,15 @@ def auto_entry(symbol):
 
 def calculate_sl(symbol, direction, entry):
     prices = price_history.get(symbol, [])
-    if len(prices) < 20:
+    if len(prices) < 10:
         return None
 
     buffer = entry * (BUFFER_PERCENT / 100)
 
     if direction == "buy":
-        return min(prices[-20:]) - buffer
+        return min(prices[-10:]) - buffer
     else:
-        return max(prices[-20:]) + buffer
+        return max(prices[-10:]) + buffer
 
 def calculate_size(entry, sl):
     risk_amt = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
@@ -161,12 +131,12 @@ def open_trade(symbol, direction, entry, entry_type):
 
     sl = calculate_sl(symbol, direction, entry)
     if not sl:
-        log("❌ SL calculation failed")
+        log("❌ SL failed")
         return None
 
     size = calculate_size(entry, sl)
     if not size:
-        log("❌ Size calculation failed")
+        log("❌ Size failed")
         return None
 
     risk = abs(entry - sl)
@@ -179,13 +149,12 @@ def open_trade(symbol, direction, entry, entry_type):
         "sl": sl,
         "tp": tp,
         "size": size,
-        "entry_type": entry_type,
         "status": "open",
         "time": str(datetime.now())
     }
 
     active_trades.append(trade)
-    log(f"✅ TRADE OPENED → {trade}")
+    log(f"🚀 TRADE OPENED → {trade}")
     return trade
 
 # ----------------- ROUTES -----------------
@@ -209,7 +178,7 @@ def webhook():
     timeframe = data.get("timeframe")
 
     if not symbol or not signal or price is None:
-        log("❌ Invalid webhook payload")
+        log("❌ Invalid webhook")
         return jsonify({"error": "invalid"}), 400
 
     update_price(symbol, price)
@@ -239,7 +208,6 @@ def update_price_route():
     if entry:
         direction, entry_type = entry
         trade = open_trade(symbol, direction, price, entry_type)
-
         if not trade:
             log("❌ Trade execution failed")
     else:
@@ -254,18 +222,6 @@ def debug():
         "price_points": {k: len(v) for k, v in price_history.items()},
         "active_trades": active_trades
     })
-
-@app.route("/dashboard")
-def dashboard():
-    html = "<html><body style='background:#111;color:#eee'>"
-    html += "<h2>Bot Dashboard</h2><table border=1>"
-    html += "<tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Status</th></tr>"
-
-    for t in active_trades:
-        html += f"<tr><td>{t['symbol']}</td><td>{t['direction']}</td><td>{t['entry']}</td><td>{t['sl']}</td><td>{t['tp']}</td><td>{t['status']}</td></tr>"
-
-    html += "</table></body></html>"
-    return html
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
