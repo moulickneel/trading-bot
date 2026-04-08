@@ -3,7 +3,7 @@ import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC BOT (AGGRESSIVE MODE) STARTED 🔥", flush=True)
+print("🔥 BTC BOT (DISCIPLINED MODE) STARTED 🔥", flush=True)
 
 symbol = "BTCUSD"
 
@@ -14,7 +14,7 @@ current_trade = None
 last_trade_time = 0
 trade_history = []
 
-COOLDOWN = 5  # faster trading
+COOLDOWN = 8  # slightly controlled
 
 log_buffer = []
 
@@ -23,7 +23,7 @@ def log(msg):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
     log_buffer.append(entry)
-    if len(log_buffer) > 100:
+    if len(log_buffer) > 120:
         log_buffer.pop(0)
 
 # ================= STATS =================
@@ -39,6 +39,8 @@ def on_price_update(price):
     global current_trade, last_trade_time
 
     prev = price_store.get(symbol)
+    prev2 = price_store.get("prev2")
+
     price_store[symbol] = price
 
     log(f"📡 BTC Price: {price}")
@@ -46,13 +48,26 @@ def on_price_update(price):
     if not prev:
         return
 
-    move = price - prev
-    trend = "up" if move > 0 else "down"
-    momentum = abs(move) > price * 0.00005  # VERY LOW threshold
+    # ========= STRUCTURE TREND =========
+    trend = None
+    if prev2:
+        if price > prev and prev > prev2:
+            trend = "up"
+        elif price < prev and prev < prev2:
+            trend = "down"
 
-    htf = bias.get(symbol, "buy")  # 🔥 DEFAULT BUY (no stall)
+    price_store["prev2"] = prev
+
+    move = price - prev
+    momentum = abs(move) > price * 0.00008  # tuned
+
+    htf = bias.get(symbol)
 
     log(f"HTF: {htf} | Trend: {trend} | Momentum: {momentum}")
+
+    if not htf:
+        log("⚠️ No HTF bias — skipping trade")
+        return
 
     now = time.time()
 
@@ -61,16 +76,18 @@ def on_price_update(price):
 
         decision = None
 
-        # Momentum based
-        if momentum:
-            if trend == "up":
+        # 🔥 STRICT HTF ALIGNMENT
+        if htf == "buy":
+            if trend == "up" and momentum:
                 decision = "buy"
-            else:
+
+        elif htf == "sell":
+            if trend == "down" and momentum:
                 decision = "sell"
 
-        # Fallback (force trade)
         if not decision:
-            decision = "buy" if trend == "up" else "sell"
+            log("❌ No valid entry condition")
+            return
 
         risk = price * 0.001
 
@@ -158,7 +175,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h2>BTC BOT (AGGRESSIVE)</h2>
+<h2>BTC BOT (DISCIPLINED)</h2>
 
 <p><b>Bias:</b> {{bias}}</p>
 <p><b>Active Trade:</b> {{trade}}</p>
@@ -186,14 +203,14 @@ def dash():
         HTML,
         bias=bias,
         trade=current_trade,
-        hist=reversed(trade_history[-20:]),
+        hist=reversed(trade_history[-25:]),
         logs=reversed(log_buffer),
         t=t, wr=wr, pnl=pnl
     )
 
 @app.route('/')
 def home():
-    return {"status": "AGGRESSIVE BOT RUNNING"}
+    return {"status": "DISCIPLINED BOT RUNNING"}
 
 # ================= RUN =================
 if __name__ == "__main__":
