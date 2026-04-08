@@ -3,18 +3,20 @@ import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC BOT (DISCIPLINED MODE) STARTED 🔥", flush=True)
+print("🔥 BTC BOT (HTF + LTF INTELLIGENT) STARTED 🔥", flush=True)
 
 symbol = "BTCUSD"
 
 bias = {}
+zones = []  # store LTF zones
 price_store = {}
 
 current_trade = None
 last_trade_time = 0
 trade_history = []
 
-COOLDOWN = 8  # slightly controlled
+COOLDOWN = 6
+ZONE_TOLERANCE = 0.002  # 0.2% proximity
 
 log_buffer = []
 
@@ -23,7 +25,7 @@ def log(msg):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
     log_buffer.append(entry)
-    if len(log_buffer) > 120:
+    if len(log_buffer) > 150:
         log_buffer.pop(0)
 
 # ================= STATS =================
@@ -35,6 +37,9 @@ def stats():
     return total, wins, total-wins, round(winrate,2), round(pnl,2)
 
 # ================= CORE =================
+def near_zone(price, zone_price):
+    return abs(price - zone_price) <= price * ZONE_TOLERANCE
+
 def on_price_update(price):
     global current_trade, last_trade_time
 
@@ -48,7 +53,7 @@ def on_price_update(price):
     if not prev:
         return
 
-    # ========= STRUCTURE TREND =========
+    # ========= TREND =========
     trend = None
     if prev2:
         if price > prev and prev > prev2:
@@ -59,15 +64,15 @@ def on_price_update(price):
     price_store["prev2"] = prev
 
     move = price - prev
-    momentum = abs(move) > price * 0.00008  # tuned
+    momentum = abs(move) > price * 0.00008
 
     htf = bias.get(symbol)
 
-    log(f"HTF: {htf} | Trend: {trend} | Momentum: {momentum}")
-
     if not htf:
-        log("⚠️ No HTF bias — skipping trade")
-        return
+        htf = "buy"  # fallback
+        log("⚠️ No HTF → fallback BUY")
+
+    log(f"HTF: {htf} | Trend: {trend} | Momentum: {momentum}")
 
     now = time.time()
 
@@ -75,18 +80,34 @@ def on_price_update(price):
     if not current_trade and (now - last_trade_time > COOLDOWN):
 
         decision = None
+        selected_zone = None
 
-        # 🔥 STRICT HTF ALIGNMENT
-        if htf == "buy":
-            if trend == "up" and momentum:
+        # 🔥 CHECK ZONES FIRST
+        for z in reversed(zones[-10:]):  # latest zones
+            if near_zone(price, z["price"]):
+
+                if htf == "buy" and z["type"] in ["bullish_ob", "bullish_fvg"]:
+                    if trend == "up" and momentum:
+                        decision = "buy"
+                        selected_zone = z
+
+                elif htf == "sell" and z["type"] in ["bearish_ob", "bearish_fvg"]:
+                    if trend == "down" and momentum:
+                        decision = "sell"
+                        selected_zone = z
+
+        # 🔥 FALLBACK (if no zone hit)
+        if not decision:
+            if htf == "buy" and trend == "up" and momentum:
                 decision = "buy"
+                log("⚡ Fallback BUY (no zone)")
 
-        elif htf == "sell":
-            if trend == "down" and momentum:
+            elif htf == "sell" and trend == "down" and momentum:
                 decision = "sell"
+                log("⚡ Fallback SELL (no zone)")
 
         if not decision:
-            log("❌ No valid entry condition")
+            log("❌ No valid entry")
             return
 
         risk = price * 0.001
@@ -99,11 +120,16 @@ def on_price_update(price):
             "entry": price,
             "sl": sl,
             "tp": tp,
+            "zone": selected_zone,
             "time": time.strftime('%H:%M:%S')
         }
 
         last_trade_time = now
-        log(f"🚀 {decision.upper()} @ {price}")
+
+        if selected_zone:
+            log(f"🚀 {decision.upper()} (ZONE) @ {price}")
+        else:
+            log(f"🚀 {decision.upper()} @ {price}")
 
     # ================= EXIT =================
     if current_trade:
@@ -158,7 +184,10 @@ def webhook():
     data = request.json or {}
 
     trend = str(data.get("trend","")).lower()
+    signal_type = str(data.get("type","")).lower()
+    price = float(data.get("price", 0))
 
+    # HTF
     if "bullish" in trend:
         bias[symbol] = "buy"
         log("🎯 HTF BUY")
@@ -166,6 +195,16 @@ def webhook():
     elif "bearish" in trend:
         bias[symbol] = "sell"
         log("🎯 HTF SELL")
+
+    # LTF ZONES
+    if signal_type in ["bullish_ob", "bearish_ob", "bullish_fvg", "bearish_fvg"]:
+        zone = {
+            "type": signal_type,
+            "price": price,
+            "time": time.strftime('%H:%M:%S')
+        }
+        zones.append(zone)
+        log(f"📍 Zone stored: {signal_type} @ {price}")
 
     return {"ok": True}
 
@@ -175,12 +214,17 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white;font-family:Arial">
 
-<h2>BTC BOT (DISCIPLINED)</h2>
+<h2>BTC BOT (SMART)</h2>
 
 <p><b>Bias:</b> {{bias}}</p>
 <p><b>Active Trade:</b> {{trade}}</p>
 
 <p><b>Trades:</b> {{t}} | <b>Winrate:</b> {{wr}}% | <b>PnL:</b> {{pnl}}R</p>
+
+<h3>Zones</h3>
+{% for z in zones %}
+<div>{{z.time}} | {{z.type}} | {{z.price}}</div>
+{% endfor %}
 
 <h3>Recent Trades</h3>
 {% for t in hist %}
@@ -203,14 +247,15 @@ def dash():
         HTML,
         bias=bias,
         trade=current_trade,
-        hist=reversed(trade_history[-25:]),
+        zones=reversed(zones[-10:]),
+        hist=reversed(trade_history[-20:]),
         logs=reversed(log_buffer),
         t=t, wr=wr, pnl=pnl
     )
 
 @app.route('/')
 def home():
-    return {"status": "DISCIPLINED BOT RUNNING"}
+    return {"status": "SMART BOT RUNNING"}
 
 # ================= RUN =================
 if __name__ == "__main__":
