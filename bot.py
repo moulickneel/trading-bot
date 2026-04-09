@@ -3,7 +3,7 @@ import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC HYBRID BOT (FIXED) STARTED 🔥", flush=True)
+print("🔥 BTC HYBRID BOT (STABLE) STARTED 🔥", flush=True)
 
 symbol = "BTCUSD"
 
@@ -35,13 +35,7 @@ def stats():
     pnl = sum(t["pnl"] for t in trade_history)
     winrate = (wins / total * 100) if total else 0
 
-    scalp = [t for t in trade_history if t["type"] == "scalp"]
-    runner = [t for t in trade_history if t["type"] == "runner"]
-
-    scalp_wr = (sum(1 for t in scalp if t["result"]=="win")/len(scalp)*100) if scalp else 0
-    runner_wr = (sum(1 for t in runner if t["result"]=="win")/len(runner)*100) if runner else 0
-
-    return total, round(winrate,2), round(pnl,2), round(scalp_wr,2), round(runner_wr,2)
+    return total, round(winrate,2), round(pnl,2)
 
 # ================= STRUCTURE =================
 def get_structure():
@@ -93,7 +87,7 @@ def on_price_update(price):
 
         p1, p2, p3, p4, p5 = price_data[-1], price_data[-2], price_data[-3], price_data[-4], price_data[-5]
 
-        # -------- SCALP (STRICT) --------
+        # -------- SCALP --------
         for z in reversed(zones[-5:]):
             if abs(price - z["price"]) < price * ZONE_TOLERANCE:
 
@@ -111,7 +105,7 @@ def on_price_update(price):
                         log("🔵 SCALP SELL")
                         break
 
-        # -------- RUNNER (RELAXED) --------
+        # -------- RUNNER --------
         if not decision:
             if htf == "buy" and structure == "up" and p1 > p2:
                 decision = "buy"
@@ -132,6 +126,10 @@ def on_price_update(price):
 
         sl = price - risk if decision == "buy" else price + risk
 
+        # 🔥 HARD FIX: NEVER allow SL = ENTRY
+        if abs(price - sl) < 1:
+            sl = price + 1 if decision == "sell" else price - 1
+
         log(f"ENTRY DEBUG → entry:{price}, sl:{sl}, risk:{risk}")
 
         current_trade = {
@@ -139,7 +137,7 @@ def on_price_update(price):
             "entry": price,
             "sl": sl,
             "type": trade_type,
-            "time": time.strftime('%H:%M:%S'),
+            "time": time.time(),
             "be_moved": False
         }
 
@@ -154,10 +152,7 @@ def on_price_update(price):
         sl = current_trade["sl"]
         trade_type = current_trade["type"]
 
-        risk = abs(entry - sl)
-
-        if risk == 0:
-            return
+        risk = max(abs(entry - sl), 1)
 
         r = (price - entry)/risk if side=="buy" else (entry - price)/risk
 
@@ -199,12 +194,21 @@ def on_price_update(price):
                         current_trade["sl"] = new_sl
                         log("📉 Trail SELL")
 
+            # 🔥 EXIT CONDITIONS
             if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
                 pnl = round(r,2)
                 current_trade["result"]="win" if pnl>0 else "loss"
                 current_trade["pnl"]=pnl
                 trade_history.append(current_trade)
                 log(f"EXIT RUNNER {pnl}R")
+                current_trade=None
+
+            # 🔥 TIMEOUT EXIT (10 min)
+            elif time.time() - current_trade["time"] > 600:
+                current_trade["result"]="timeout"
+                current_trade["pnl"]=0
+                trade_history.append(current_trade)
+                log("⏰ TIMEOUT EXIT")
                 current_trade=None
 
 # ================= PRICE LOOP =================
@@ -256,13 +260,12 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white">
 
-<h2>BTC HYBRID BOT (FIXED)</h2>
+<h2>BTC HYBRID BOT (STABLE)</h2>
 
 <p>Bias: {{bias}}</p>
 <p>Active: {{trade}}</p>
 
 <p>Trades: {{t}} | Winrate: {{wr}}% | PnL: {{pnl}}R</p>
-<p>Scalp WR: {{swr}}% | Runner WR: {{rwr}}%</p>
 
 <h3>Zones</h3>
 {% for z in zones %}
@@ -271,7 +274,7 @@ HTML = """
 
 <h3>Trades</h3>
 {% for t in hist %}
-<div>{{t.time}} | {{t.side}} | {{t.type}} | {{t.result}} | {{t.pnl}}R</div>
+<div>{{t.side}} | {{t.type}} | {{t.result}} | {{t.pnl}}R</div>
 {% endfor %}
 
 <h3>Logs</h3>
@@ -285,7 +288,7 @@ HTML = """
 
 @app.route('/dashboard')
 def dash():
-    t,wr,pnl,swr,rwr = stats()
+    t,wr,pnl = stats()
     return render_template_string(
         HTML,
         bias=bias,
@@ -293,12 +296,12 @@ def dash():
         zones=reversed(zones[-10:]),
         hist=reversed(trade_history[-20:]),
         logs=reversed(log_buffer),
-        t=t, wr=wr, pnl=pnl, swr=swr, rwr=rwr
+        t=t, wr=wr, pnl=pnl
     )
 
 @app.route('/')
 def home():
-    return {"status": "BOT RUNNING (FIXED)"}
+    return {"status": "BOT RUNNING STABLE"}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
