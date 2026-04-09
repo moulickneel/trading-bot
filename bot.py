@@ -3,7 +3,7 @@ import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC HYBRID BOT (STABLE) STARTED 🔥", flush=True)
+print("🔥 BTC HYBRID BOT (PRO) STARTED 🔥", flush=True)
 
 symbol = "BTCUSD"
 
@@ -34,7 +34,6 @@ def stats():
     wins = sum(1 for t in trade_history if t["result"] == "win")
     pnl = sum(t["pnl"] for t in trade_history)
     winrate = (wins / total * 100) if total else 0
-
     return total, round(winrate,2), round(pnl,2)
 
 # ================= STRUCTURE =================
@@ -49,7 +48,6 @@ def get_structure():
         return "up"
     elif min(highs) < min(lows):
         return "down"
-
     return None
 
 # ================= CORE =================
@@ -64,12 +62,10 @@ def on_price_update(price):
 
     structure = get_structure()
     if not structure:
-        log("⚠️ No structure")
         return
 
     htf = bias.get(symbol)
     if not htf:
-        log("⚠️ No HTF bias")
         return
 
     log(f"HTF: {htf} | Structure: {structure}")
@@ -118,15 +114,14 @@ def on_price_update(price):
                 log("🔴 RUNNER SELL")
 
         if not decision:
-            log("❌ No entry")
             return
 
-        # 🔥 SAFE RISK
+        # SAFE RISK
         risk = max(price * 0.001, 1)
 
         sl = price - risk if decision == "buy" else price + risk
 
-        # 🔥 HARD FIX: NEVER allow SL = ENTRY
+        # HARD FIX
         if abs(price - sl) < 1:
             sl = price + 1 if decision == "sell" else price - 1
 
@@ -137,7 +132,8 @@ def on_price_update(price):
             "entry": price,
             "sl": sl,
             "type": trade_type,
-            "time": time.time(),
+            "time": time.strftime('%H:%M:%S'),
+            "timestamp": time.time(),
             "be_moved": False
         }
 
@@ -156,7 +152,7 @@ def on_price_update(price):
 
         r = (price - entry)/risk if side=="buy" else (entry - price)/risk
 
-        # -------- SCALP EXIT --------
+        # SCALP EXIT
         if trade_type == "scalp":
             tp = entry + risk*1.5 if side=="buy" else entry - risk*1.5
 
@@ -174,7 +170,7 @@ def on_price_update(price):
                 log("❌ SCALP SL")
                 current_trade=None
 
-        # -------- RUNNER EXIT --------
+        # RUNNER EXIT
         elif trade_type == "runner":
 
             if r >= 1 and not current_trade["be_moved"]:
@@ -194,7 +190,6 @@ def on_price_update(price):
                         current_trade["sl"] = new_sl
                         log("📉 Trail SELL")
 
-            # 🔥 EXIT CONDITIONS
             if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
                 pnl = round(r,2)
                 current_trade["result"]="win" if pnl>0 else "loss"
@@ -203,8 +198,7 @@ def on_price_update(price):
                 log(f"EXIT RUNNER {pnl}R")
                 current_trade=None
 
-            # 🔥 TIMEOUT EXIT (10 min)
-            elif time.time() - current_trade["time"] > 600:
+            elif time.time() - current_trade["timestamp"] > 600:
                 current_trade["result"]="timeout"
                 current_trade["pnl"]=0
                 trade_history.append(current_trade)
@@ -232,25 +226,59 @@ def webhook():
 
     log(f"📩 {data}")
 
-    trend = str(data.get("trend","")).lower()
-    signal_type = str(data.get("type","")).lower()
     price = float(data.get("price",0) or 0)
 
-    if "bullish" in trend:
-        bias[symbol] = "buy"
-        log("🎯 HTF BUY")
+    signal = str(data.get("signal","")).lower()
+    zone_type = str(data.get("zone","")).lower()
+    trend = str(data.get("trend","")).lower()
+    tf = str(data.get("timeframe","")).lower()
 
-    elif "bearish" in trend:
-        bias[symbol] = "sell"
-        log("🎯 HTF SELL")
+    # ===== HTF =====
+    if tf == "htf":
 
-    if signal_type in ["bullish_ob","bearish_ob","bullish_fvg","bearish_fvg"]:
-        zones.append({
-            "type": signal_type,
-            "price": price,
-            "time": time.strftime('%H:%M:%S')
-        })
-        log(f"📍 Zone stored {signal_type} @ {price}")
+        if "bos" in signal and "internal" not in signal:
+            if "bullish" in signal:
+                bias[symbol] = "buy"
+                log("🎯 HTF STRONG BUY (BOS)")
+            elif "bearish" in signal:
+                bias[symbol] = "sell"
+                log("🎯 HTF STRONG SELL (BOS)")
+
+        elif "choch" in signal:
+            if "bullish" in signal:
+                bias[symbol] = "buy"
+                log("⚠️ HTF EARLY BUY (CHOCH)")
+            elif "bearish" in signal:
+                bias[symbol] = "sell"
+                log("⚠️ HTF EARLY SELL (CHOCH)")
+
+        elif "internal" in signal:
+            log("🚫 Ignored INTERNAL HTF")
+
+    # ===== LTF ZONES =====
+    if tf == "ltf":
+
+        zone_label = None
+
+        if "ob" in zone_type:
+            if "bullish" in trend:
+                zone_label = "bullish_ob"
+            elif "bearish" in trend:
+                zone_label = "bearish_ob"
+
+        elif "fvg" in zone_type:
+            if "bullish" in trend:
+                zone_label = "bullish_fvg"
+            elif "bearish" in trend:
+                zone_label = "bearish_fvg"
+
+        if zone_label:
+            zones.append({
+                "type": zone_label,
+                "price": price,
+                "time": time.strftime('%H:%M:%S')
+            })
+            log(f"📍 Zone stored {zone_label} @ {price}")
 
     return {"ok": True}
 
@@ -260,7 +288,7 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white">
 
-<h2>BTC HYBRID BOT (STABLE)</h2>
+<h2>BTC HYBRID BOT (PRO)</h2>
 
 <p>Bias: {{bias}}</p>
 <p>Active: {{trade}}</p>
@@ -274,7 +302,7 @@ HTML = """
 
 <h3>Trades</h3>
 {% for t in hist %}
-<div>{{t.side}} | {{t.type}} | {{t.result}} | {{t.pnl}}R</div>
+<div>{{t.time}} | {{t.side}} | {{t.type}} | {{t.result}} | {{t.pnl}}R</div>
 {% endfor %}
 
 <h3>Logs</h3>
@@ -301,7 +329,7 @@ def dash():
 
 @app.route('/')
 def home():
-    return {"status": "BOT RUNNING STABLE"}
+    return {"status": "BOT RUNNING PRO"}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
