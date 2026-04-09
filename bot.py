@@ -3,7 +3,7 @@ import time, os, threading, requests
 
 app = Flask(__name__)
 
-print("🔥 BTC BOT (STABLE PRO VERSION) STARTED 🔥", flush=True)
+print("🔥 BTC BOT (FINAL STABLE VERSION) STARTED 🔥", flush=True)
 
 symbol = "BTCUSD"
 
@@ -16,11 +16,10 @@ last_trade_time = 0
 last_bias_trade = None
 
 trade_history = []
+log_buffer = []
 
 COOLDOWN = 180
 ZONE_TOLERANCE = 0.003
-
-log_buffer = []
 
 # ================= LOG =================
 def log(msg):
@@ -38,28 +37,31 @@ def stats():
     winrate = (wins / total * 100) if total else 0
     return total, round(winrate,2), round(pnl,2)
 
-# ================= PRICE API =================
+# ================= PRICE FETCH =================
 def get_price():
-    try:
-        url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-        res = requests.get(url, timeout=5).json()
-        return float(res["data"]["amount"])
-    except:
-        log("⚠️ Coinbase failed")
+    apis = [
+        ("coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot"),
+        ("binance", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"),
+        ("coingecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+    ]
+
+    for name, url in apis:
         try:
-            url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-            res = requests.get(url, timeout=5).json()
-            log("🔁 Using Binance fallback")
-            return float(res["price"])
-        except:
-            log("⚠️ Binance failed")
-            try:
-                url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-                res = requests.get(url, timeout=5).json()
-                log("🔁 Using CoinGecko fallback")
+            res = requests.get(url, timeout=4).json()
+
+            if name == "coinbase":
+                return float(res["data"]["amount"])
+
+            elif name == "binance":
+                return float(res["price"])
+
+            elif name == "coingecko":
                 return float(res["bitcoin"]["usd"])
-            except:
-                return None
+
+        except:
+            continue
+
+    return None
 
 # ================= STRUCTURE =================
 def get_structure():
@@ -80,16 +82,13 @@ def strong_candle():
     if len(price_data) < 3:
         return None
 
-    curr = price_data[-1]
-    prev = price_data[-2]
-    prev2 = price_data[-3]
+    c = price_data[-1]
+    p = price_data[-2]
+    p2 = price_data[-3]
 
-    # BUY: HH + HL structure
-    if curr > prev and prev > prev2:
+    if c > p > p2:
         return "buy"
-
-    # SELL: LL + LH structure
-    if curr < prev and prev < prev2:
+    elif c < p < p2:
         return "sell"
 
     return None
@@ -168,7 +167,6 @@ def on_price_update(price):
             return
 
         risk = max(price * 0.001, 1)
-
         sl = price - risk if decision == "buy" else price + risk
 
         current_trade = {
@@ -198,4 +196,131 @@ def on_price_update(price):
 
         # SCALP
         if trade_type == "scalp":
-            tp = entry + risk*1.5 if side=="
+            tp = entry + risk*1.5 if side=="buy" else entry - risk*1.5
+
+            if (side=="buy" and price >= tp) or (side=="sell" and price <= tp):
+                current_trade["result"]="win"
+                current_trade["pnl"]=1.5
+                trade_history.append(current_trade)
+                log("✅ SCALP TP")
+                current_trade=None
+
+            elif (side=="buy" and price <= sl) or (side=="sell" and price >= sl):
+                current_trade["result"]="loss"
+                current_trade["pnl"]=-1
+                trade_history.append(current_trade)
+                log("❌ SCALP SL")
+                current_trade=None
+
+        # RUNNER
+        elif trade_type == "runner":
+
+            if r >= 1.5 and not current_trade["be_moved"]:
+                current_trade["sl"] = entry
+                current_trade["be_moved"] = True
+                log("🔒 BE moved")
+
+            if r >= 2:
+                if side=="buy":
+                    new_sl = price - risk
+                    if new_sl > current_trade["sl"]:
+                        current_trade["sl"] = new_sl
+                        log("📈 Trail BUY")
+                else:
+                    new_sl = price + risk
+                    if new_sl < current_trade["sl"]:
+                        current_trade["sl"] = new_sl
+                        log("📉 Trail SELL")
+
+            if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
+                pnl = round(r,2)
+                current_trade["result"]="win" if pnl>0 else "loss"
+                current_trade["pnl"]=pnl
+                trade_history.append(current_trade)
+                log(f"EXIT RUNNER {pnl}R")
+                current_trade=None
+
+# ================= LOOP =================
+def price_loop():
+    while True:
+        try:
+            price = get_price()
+            if price:
+                on_price_update(price)
+            else:
+                log("❌ ALL APIS FAILED")
+        except Exception as e:
+            log(f"❌ CRITICAL: {e}")
+
+        time.sleep(2)
+
+threading.Thread(target=price_loop, daemon=True).start()
+
+# ================= WEBHOOK =================
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.json or {}
+    log(f"📩 {data}")
+
+    price = float(data.get("price",0) or 0)
+    signal = str(data.get("signal","")).lower()
+    trend = str(data.get("trend","")).lower()
+    tf = str(data.get("timeframe","")).lower()
+
+    if tf == "htf":
+        if "bullish" in signal:
+            bias[symbol] = "buy"
+            log("🎯 HTF BUY")
+        elif "bearish" in signal:
+            bias[symbol] = "sell"
+            log("🎯 HTF SELL")
+
+    if tf == "ltf":
+        if "bullish" in trend:
+            zones.append({"type":"bullish_zone","price":price})
+            log("📍 Bullish Zone")
+        elif "bearish" in trend:
+            zones.append({"type":"bearish_zone","price":price})
+            log("📍 Bearish Zone")
+
+    return {"ok": True}
+
+# ================= DASHBOARD =================
+HTML = """
+<html><head><meta http-equiv="refresh" content="2"></head>
+<body style="background:#0f172a;color:white">
+<h2>BTC BOT FINAL</h2>
+<p>Bias: {{bias}}</p>
+<p>Active: {{trade}}</p>
+<p>Trades: {{t}} | Winrate: {{wr}}% | PnL: {{pnl}}R</p>
+
+<h3>Trades</h3>
+{% for t in hist %}
+<div>{{t.display_time}} | {{t.side}} | {{t.type}} | {{t.result}} | {{t.pnl}}R</div>
+{% endfor %}
+
+<h3>Logs</h3>
+{% for l in logs %}
+<div>{{l}}</div>
+{% endfor %}
+</body></html>
+"""
+
+@app.route('/dashboard')
+def dash():
+    t,wr,pnl = stats()
+    return render_template_string(
+        HTML,
+        bias=bias,
+        trade=current_trade,
+        hist=reversed(trade_history[-20:]),
+        logs=reversed(log_buffer),
+        t=t, wr=wr, pnl=pnl
+    )
+
+@app.route('/')
+def home():
+    return {"status":"BOT RUNNING FINAL"}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
