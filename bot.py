@@ -11,13 +11,12 @@ price_data = []
 
 current_trade = None
 last_trade_time = 0
-last_bias_trade = None
 
 trade_history = []
 log_buffer = []
 
 COOLDOWN = 180
-ZONE_TOLERANCE = 0.003
+ZONE_TOLERANCE = 0.005  # 🔥 increased
 
 MAX_AGE_FVG = 8
 MAX_AGE_OB = 15
@@ -65,20 +64,6 @@ def get_price():
             log(f"⚠️ API fail: {e}")
             continue
 
-    return None
-
-# ================= STRUCTURE =================
-def get_structure():
-    if len(price_data) < 10:
-        return None
-
-    highs = price_data[-5:]
-    lows = price_data[-10:-5]
-
-    if max(highs) > max(lows):
-        return "up"
-    elif min(highs) < min(lows):
-        return "down"
     return None
 
 # ================= DISPLACEMENT =================
@@ -129,7 +114,7 @@ def get_valid_zones(price):
 
 # ================= CORE =================
 def on_price_update(price):
-    global current_trade, last_trade_time, last_bias_trade
+    global current_trade, last_trade_time
 
     try:
         price_data.append(price)
@@ -137,10 +122,6 @@ def on_price_update(price):
             price_data.pop(0)
 
         log(f"📡 Price: {price}")
-
-        structure = get_structure()
-        if not structure:
-            return
 
         htf = bias.get(symbol)
         if not htf:
@@ -152,9 +133,6 @@ def on_price_update(price):
 
         if not current_trade and (now - last_trade_time > COOLDOWN):
 
-            if htf == last_bias_trade:
-                return
-
             decision = None
             trade_type = None
             disp = displacement_candle()
@@ -163,13 +141,13 @@ def on_price_update(price):
             for z in reversed(valid_zones[-5:]):
                 if abs(price - z["price"]) < price * ZONE_TOLERANCE:
 
-                    if htf == "buy" and structure == "up" and "bullish" in z["type"] and disp == "buy":
+                    if htf == "buy" and "bullish" in z["type"] and disp == "buy":
                         decision = "buy"
                         trade_type = "scalp"
                         log(f"🔵 SCALP BUY ({z['type']})")
                         break
 
-                    elif htf == "sell" and structure == "down" and "bearish" in z["type"] and disp == "sell":
+                    elif htf == "sell" and "bearish" in z["type"] and disp == "sell":
                         decision = "sell"
                         trade_type = "scalp"
                         log(f"🔵 SCALP SELL ({z['type']})")
@@ -177,12 +155,12 @@ def on_price_update(price):
 
             # ===== RUNNER =====
             if not decision:
-                if htf == "buy" and structure == "up" and disp == "buy":
+                if htf == "buy" and disp == "buy":
                     decision = "buy"
                     trade_type = "runner"
                     log("🔴 RUNNER BUY")
 
-                elif htf == "sell" and structure == "down" and disp == "sell":
+                elif htf == "sell" and disp == "sell":
                     decision = "sell"
                     trade_type = "runner"
                     log("🔴 RUNNER SELL")
@@ -204,7 +182,6 @@ def on_price_update(price):
             }
 
             last_trade_time = now
-            last_bias_trade = htf
 
             log(f"🚀 {decision.upper()} [{trade_type}]")
 
@@ -289,10 +266,7 @@ def webhook():
         if tf == "htf":
             if "bos" in signal and "internal" not in signal:
                 bias[symbol] = "buy" if "bullish" in signal else "sell"
-                log(f"🎯 HTF BOS {bias[symbol]}")
-            elif "choch" in signal and "internal" not in signal:
-                bias[symbol] = "buy" if "bullish" in signal else "sell"
-                log(f"⚠️ HTF CHOCH {bias[symbol]}")
+                log(f"🎯 HTF {bias[symbol]}")
 
         if tf == "ltf":
             if "swing ob" in signal or "fvg" in signal:
