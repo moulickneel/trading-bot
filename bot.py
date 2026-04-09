@@ -24,38 +24,47 @@ MAX_AGE_OB = 15
 
 # ================= LOG =================
 def log(msg):
-    entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(entry, flush=True)
-    log_buffer.append(entry)
-    if len(log_buffer) > 200:
-        log_buffer.pop(0)
+    try:
+        entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        print(entry, flush=True)
+        log_buffer.append(entry)
+        if len(log_buffer) > 200:
+            log_buffer.pop(0)
+    except:
+        pass
 
 # ================= STATS =================
 def stats():
-    total = len(trade_history)
-    wins = sum(1 for t in trade_history if t["result"] == "win")
-    pnl = sum(t["pnl"] for t in trade_history)
-    winrate = (wins / total * 100) if total else 0
-    return total, round(winrate,2), round(pnl,2)
+    try:
+        total = len(trade_history)
+        wins = sum(1 for t in trade_history if t.get("result") == "win")
+        pnl = sum(t.get("pnl", 0) for t in trade_history)
+        winrate = (wins / total * 100) if total else 0
+        return total, round(winrate,2), round(pnl,2)
+    except:
+        return 0,0,0
 
 # ================= PRICE =================
 def get_price():
     apis = [
         "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-        "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
         "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
     ]
+
     for url in apis:
         try:
-            res = requests.get(url, timeout=4).json()
-            if "data" in res:
-                return float(res["data"]["amount"])
-            if "price" in res:
-                return float(res["price"])
-            if "bitcoin" in res:
-                return float(res["bitcoin"]["usd"])
-        except:
+            res = requests.get(url, timeout=3)
+            data = res.json()
+
+            if "data" in data:
+                return float(data["data"]["amount"])
+            if "bitcoin" in data:
+                return float(data["bitcoin"]["usd"])
+
+        except Exception as e:
+            log(f"⚠️ API fail: {e}")
             continue
+
     return None
 
 # ================= STRUCTURE =================
@@ -97,21 +106,24 @@ def displacement_candle():
 def get_valid_zones(price):
     valid = []
     for z in zones[:]:
-        age = len(price_data) - z["index"]
+        try:
+            age = len(price_data) - z["index"]
 
-        if "fvg" in z["type"] and age > MAX_AGE_FVG:
-            zones.remove(z)
-            continue
-        if "swing_ob" in z["type"] and age > MAX_AGE_OB:
-            zones.remove(z)
-            continue
+            if "fvg" in z["type"] and age > MAX_AGE_FVG:
+                zones.remove(z)
+                continue
+            if "swing_ob" in z["type"] and age > MAX_AGE_OB:
+                zones.remove(z)
+                continue
 
-        if abs(price - z["price"]) < price * ZONE_TOLERANCE:
-            zones.remove(z)
-            log(f"💥 Mitigated {z['type']}")
-            continue
+            if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+                zones.remove(z)
+                log(f"💥 Mitigated {z['type']}")
+                continue
 
-        valid.append(z)
+            valid.append(z)
+        except:
+            continue
 
     return valid
 
@@ -119,130 +131,133 @@ def get_valid_zones(price):
 def on_price_update(price):
     global current_trade, last_trade_time, last_bias_trade
 
-    price_data.append(price)
-    if len(price_data) > 50:
-        price_data.pop(0)
+    try:
+        price_data.append(price)
+        if len(price_data) > 50:
+            price_data.pop(0)
 
-    log(f"📡 Price: {price}")
+        log(f"📡 Price: {price}")
 
-    structure = get_structure()
-    if not structure:
-        return
-
-    htf = bias.get(symbol)
-    if not htf:
-        return
-
-    valid_zones = get_valid_zones(price)
-
-    now = time.time()
-
-    if not current_trade and (now - last_trade_time > COOLDOWN):
-
-        if htf == last_bias_trade:
+        structure = get_structure()
+        if not structure:
             return
 
-        decision = None
-        trade_type = None
+        htf = bias.get(symbol)
+        if not htf:
+            return
 
-        disp = displacement_candle()
+        valid_zones = get_valid_zones(price)
 
-        # ===== SCALP =====
-        for z in reversed(valid_zones[-5:]):
-            if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+        now = time.time()
 
-                if htf == "buy" and structure == "up" and "bullish" in z["type"]:
-                    if disp == "buy":
+        if not current_trade and (now - last_trade_time > COOLDOWN):
+
+            if htf == last_bias_trade:
+                return
+
+            decision = None
+            trade_type = None
+            disp = displacement_candle()
+
+            # ===== SCALP =====
+            for z in reversed(valid_zones[-5:]):
+                if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+
+                    if htf == "buy" and structure == "up" and "bullish" in z["type"] and disp == "buy":
                         decision = "buy"
                         trade_type = "scalp"
                         log(f"🔵 SCALP BUY ({z['type']})")
                         break
 
-                elif htf == "sell" and structure == "down" and "bearish" in z["type"]:
-                    if disp == "sell":
+                    elif htf == "sell" and structure == "down" and "bearish" in z["type"] and disp == "sell":
                         decision = "sell"
                         trade_type = "scalp"
                         log(f"🔵 SCALP SELL ({z['type']})")
                         break
 
-        # ===== RUNNER =====
-        if not decision:
-            if htf == "buy" and structure == "up" and disp == "buy":
-                decision = "buy"
-                trade_type = "runner"
-                log("🔴 RUNNER BUY")
+            # ===== RUNNER =====
+            if not decision:
+                if htf == "buy" and structure == "up" and disp == "buy":
+                    decision = "buy"
+                    trade_type = "runner"
+                    log("🔴 RUNNER BUY")
 
-            elif htf == "sell" and structure == "down" and disp == "sell":
-                decision = "sell"
-                trade_type = "runner"
-                log("🔴 RUNNER SELL")
+                elif htf == "sell" and structure == "down" and disp == "sell":
+                    decision = "sell"
+                    trade_type = "runner"
+                    log("🔴 RUNNER SELL")
 
-        if not decision:
-            return
+            if not decision:
+                return
 
-        risk = max(price * 0.001, 1)
-        sl = price - risk if decision == "buy" else price + risk
+            risk = max(price * 0.001, 1)
+            sl = price - risk if decision == "buy" else price + risk
 
-        current_trade = {
-            "side": decision,
-            "entry": price,
-            "sl": sl,
-            "type": trade_type,
-            "display_time": time.strftime('%H:%M:%S'),
-            "timestamp": time.time(),
-            "be_moved": False
-        }
+            current_trade = {
+                "side": decision,
+                "entry": price,
+                "sl": sl,
+                "type": trade_type,
+                "display_time": time.strftime('%H:%M:%S'),
+                "timestamp": time.time(),
+                "be_moved": False
+            }
 
-        last_trade_time = now
-        last_bias_trade = htf
+            last_trade_time = now
+            last_bias_trade = htf
 
-        log(f"🚀 {decision.upper()} [{trade_type}] @ {price}")
+            log(f"🚀 {decision.upper()} [{trade_type}]")
 
-    # ===== EXIT =====
-    if current_trade:
-        side = current_trade["side"]
-        entry = current_trade["entry"]
-        sl = current_trade["sl"]
-        trade_type = current_trade["type"]
+        # ===== EXIT =====
+        if current_trade:
+            side = current_trade["side"]
+            entry = current_trade["entry"]
+            sl = current_trade["sl"]
 
-        risk = abs(entry - sl)
-        r = (price - entry)/risk if side=="buy" else (entry - price)/risk
+            risk = abs(entry - sl)
+            if risk == 0:
+                return
 
-        if trade_type == "scalp":
-            tp = entry + risk*1.5 if side=="buy" else entry - risk*1.5
+            r = (price - entry)/risk if side=="buy" else (entry - price)/risk
 
-            if (side=="buy" and price >= tp) or (side=="sell" and price <= tp):
-                current_trade["result"]="win"
-                current_trade["pnl"]=1.5
-                trade_history.append(current_trade)
-                log("✅ SCALP TP")
-                current_trade=None
+            if current_trade["type"] == "scalp":
+                tp = entry + risk*1.5 if side=="buy" else entry - risk*1.5
 
-            elif (side=="buy" and price <= sl) or (side=="sell" and price >= sl):
-                current_trade["result"]="loss"
-                current_trade["pnl"]=-1
-                trade_history.append(current_trade)
-                log("❌ SCALP SL")
-                current_trade=None
+                if (side=="buy" and price >= tp) or (side=="sell" and price <= tp):
+                    current_trade["result"]="win"
+                    current_trade["pnl"]=1.5
+                    trade_history.append(current_trade)
+                    log("✅ SCALP TP")
+                    current_trade=None
 
-        else:
-            if r >= 1.5 and not current_trade["be_moved"]:
-                current_trade["sl"] = entry
-                current_trade["be_moved"] = True
-                log("🔒 BE moved")
+                elif (side=="buy" and price <= sl) or (side=="sell" and price >= sl):
+                    current_trade["result"]="loss"
+                    current_trade["pnl"]=-1
+                    trade_history.append(current_trade)
+                    log("❌ SCALP SL")
+                    current_trade=None
 
-            if r >= 2:
-                if side=="buy":
-                    current_trade["sl"] = max(current_trade["sl"], price - risk)
-                else:
-                    current_trade["sl"] = min(current_trade["sl"], price + risk)
+            else:
+                if r >= 1.5 and not current_trade["be_moved"]:
+                    current_trade["sl"] = entry
+                    current_trade["be_moved"] = True
+                    log("🔒 BE moved")
 
-            if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
-                current_trade["result"]="win" if r>0 else "loss"
-                current_trade["pnl"]=round(r,2)
-                trade_history.append(current_trade)
-                log(f"EXIT RUNNER {round(r,2)}R")
-                current_trade=None
+                if r >= 2:
+                    if side=="buy":
+                        current_trade["sl"] = max(current_trade["sl"], price - risk)
+                    else:
+                        current_trade["sl"] = min(current_trade["sl"], price + risk)
+
+                if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
+                    current_trade["result"]="win" if r>0 else "loss"
+                    current_trade["pnl"]=round(r,2)
+                    trade_history.append(current_trade)
+                    log(f"EXIT RUNNER {round(r,2)}R")
+                    current_trade=None
+
+    except Exception as e:
+        log(f"❌ CORE ERROR: {e}")
 
 # ================= LOOP =================
 def price_loop():
@@ -251,8 +266,10 @@ def price_loop():
             price = get_price()
             if price:
                 on_price_update(price)
+            else:
+                log("⚠️ Price unavailable")
         except Exception as e:
-            log(f"❌ {e}")
+            log(f"❌ LOOP ERROR: {e}")
         time.sleep(2)
 
 threading.Thread(target=price_loop, daemon=True).start()
@@ -260,34 +277,38 @@ threading.Thread(target=price_loop, daemon=True).start()
 # ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.json or {}
-    log(f"📩 {data}")
+    try:
+        data = request.json or {}
+        log(f"📩 {data}")
 
-    price = float(data.get("price",0))
-    signal = str(data.get("signal","")).lower()
-    trend = str(data.get("trend","")).lower()
-    tf = str(data.get("timeframe","")).lower()
+        price = float(data.get("price",0))
+        signal = str(data.get("signal","")).lower()
+        trend = str(data.get("trend","")).lower()
+        tf = str(data.get("timeframe","")).lower()
 
-    if tf == "htf":
-        if "bos" in signal and "internal" not in signal:
-            bias[symbol] = "buy" if "bullish" in signal else "sell"
-            log(f"🎯 HTF BOS {bias[symbol]}")
-        elif "choch" in signal and "internal" not in signal:
-            bias[symbol] = "buy" if "bullish" in signal else "sell"
-            log(f"⚠️ HTF CHOCH {bias[symbol]}")
+        if tf == "htf":
+            if "bos" in signal and "internal" not in signal:
+                bias[symbol] = "buy" if "bullish" in signal else "sell"
+                log(f"🎯 HTF BOS {bias[symbol]}")
+            elif "choch" in signal and "internal" not in signal:
+                bias[symbol] = "buy" if "bullish" in signal else "sell"
+                log(f"⚠️ HTF CHOCH {bias[symbol]}")
 
-    if tf == "ltf":
-        if "swing ob" in signal or "fvg" in signal:
-            zone = ("bullish_" if "bullish" in trend else "bearish_") + ("swing_ob" if "ob" in signal else "fvg")
-            zones.append({
-                "type": zone,
-                "price": price,
-                "time": time.strftime('%H:%M:%S'),
-                "index": len(price_data)
-            })
-            log(f"📍 Zone {zone}")
+        if tf == "ltf":
+            if "swing ob" in signal or "fvg" in signal:
+                zone = ("bullish_" if "bullish" in trend else "bearish_") + ("swing_ob" if "ob" in signal else "fvg")
+                zones.append({
+                    "type": zone,
+                    "price": price,
+                    "time": time.strftime('%H:%M:%S'),
+                    "index": len(price_data)
+                })
+                log(f"📍 Zone {zone}")
 
-    return {"ok": True}
+        return {"ok": True}
+    except Exception as e:
+        log(f"❌ WEBHOOK ERROR: {e}")
+        return {"error": str(e)}
 
 # ================= DASHBOARD =================
 HTML = """
@@ -330,6 +351,10 @@ def dash():
         zones=zones[-10:],
         t=t, wr=wr, pnl=pnl
     )
+
+@app.route('/health')
+def health():
+    return {"status":"ok"}
 
 @app.route('/')
 def home():
