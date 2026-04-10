@@ -1,47 +1,43 @@
 from flask import Flask, request, render_template_string
-import time, requests
+import time, requests, threading
 
 app = Flask(__name__)
 
 symbol = "BTCUSD"
 
-bias = {}
+bias = None
 zones = []
 price_data = []
-current_trade = None
 
-log_buffer = []
-last_price = None
-last_fetch = 0
+current_trade = None
+last_trade_time = 0
+
+COOLDOWN = 120
+ZONE_TOLERANCE = 0.005
+
+log_file = "logs.txt"
 
 # ================= LOG =================
 def log(msg):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
-    log_buffer.append(entry)
-    if len(log_buffer) > 200:
-        log_buffer.pop(0)
+    with open(log_file, "a") as f:
+        f.write(entry + "\n")
 
-# ================= SAFE PRICE =================
-def get_price():
-    global last_price, last_fetch
-
-    # fetch only every 3 seconds
-    if time.time() - last_fetch < 3:
-        return last_price
-
-    last_fetch = time.time()
-
+def get_logs():
     try:
-        r = requests.get(
-            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-            timeout=1.5
-        )
-        last_price = float(r.json()["data"]["amount"])
-        return last_price
+        with open(log_file, "r") as f:
+            return f.readlines()[-200:]
     except:
-        log("⚠️ price fetch fail")
-        return last_price
+        return []
+
+# ================= PRICE =================
+def get_price():
+    try:
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=2)
+        return float(r.json()["data"]["amount"])
+    except:
+        return None
 
 # ================= DISPLACEMENT =================
 def displacement():
@@ -58,42 +54,59 @@ def displacement():
 
     return None
 
-# ================= BOT TICK =================
-def bot_tick():
-    global current_trade
+# ================= BOT LOOP =================
+def bot_loop():
+    global current_trade, last_trade_time
 
-    price = get_price()
-    if not price:
-        return
+    while True:
+        try:
+            price = get_price()
 
-    price_data.append(price)
-    if len(price_data) > 50:
-        price_data.pop(0)
+            if price:
+                price_data.append(price)
+                if len(price_data) > 50:
+                    price_data.pop(0)
 
-    log(f"📡 {price}")
+                log(f"📡 {price}")
 
-    htf = bias.get(symbol)
-    disp = displacement()
+                disp = displacement()
 
-    if not htf or not disp:
-        return
+                if bias and disp:
 
-    # ENTRY
-    if not current_trade:
-        for z in zones[-5:]:
-            if abs(price - z["price"]) < price * 0.005:
+                    now = time.time()
 
-                if htf == "buy" and disp == "buy":
-                    current_trade = {"side": "buy", "entry": price}
-                    log("🚀 BUY")
+                    if not current_trade and now - last_trade_time > COOLDOWN:
 
-                elif htf == "sell" and disp == "sell":
-                    current_trade = {"side": "sell", "entry": price}
-                    log("🚀 SELL")
+                        for z in zones[-5:]:
+
+                            if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+
+                                # ===== BUY =====
+                                if bias == "buy" and z["trend"] == "bullish" and disp == "buy":
+                                    current_trade = {"side":"buy","entry":price}
+                                    last_trade_time = now
+                                    log(f"🚀 BUY ({z['type']})")
+                                    break
+
+                                # ===== SELL =====
+                                elif bias == "sell" and z["trend"] == "bearish" and disp == "sell":
+                                    current_trade = {"side":"sell","entry":price}
+                                    last_trade_time = now
+                                    log(f"🚀 SELL ({z['type']})")
+                                    break
+
+        except Exception as e:
+            log(f"❌ ERROR {e}")
+
+        time.sleep(2)
+
+threading.Thread(target=bot_loop, daemon=True).start()
 
 # ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    global bias
+
     data = request.json or {}
     log(f"📩 {data}")
 
@@ -102,20 +115,39 @@ def webhook():
     tf = str(data.get("timeframe","")).lower()
     price = float(data.get("price",0))
 
+    # ===== HTF =====
     if tf == "htf":
-        if "bullish" in signal:
-            bias[symbol] = "buy"
-        elif "bearish" in signal:
-            bias[symbol] = "sell"
 
+        # PRIORITY: CHOCH
+        if "choch" in signal:
+            bias = "buy" if "bullish" in signal else "sell"
+            log(f"🔥 HTF CHOCH → {bias}")
+
+        # SECOND: BOS (only if no bias yet)
+        elif "bos" in signal and bias is None:
+            bias = "buy" if "bullish" in signal else "sell"
+            log(f"📊 HTF BOS → {bias}")
+
+    # ===== LTF =====
     if tf == "ltf":
-        if "fvg" in signal or "ob" in signal:
-            zones.append({
-                "type": trend,
-                "price": price,
-                "time": time.strftime('%H:%M:%S')
-            })
-            log(f"📍 Zone {trend}")
+
+        if "fvg" in signal:
+            ztype = "fvg"
+        elif "swing ob" in signal:
+            ztype = "swing_ob"
+        elif "internal ob" in signal:
+            ztype = "internal_ob"
+        else:
+            return {"ok": True}
+
+        zones.append({
+            "type": ztype,
+            "trend": trend,
+            "price": price,
+            "time": time.strftime('%H:%M:%S')
+        })
+
+        log(f"📍 {trend} {ztype}")
 
     return {"ok": True}
 
@@ -123,43 +155,44 @@ def webhook():
 HTML = """
 <html>
 <head><meta http-equiv="refresh" content="3"></head>
-<body style="background:#0f172a;color:white">
-<h2>BTC BOT</h2>
+<body style="background:#0f172a;color:white;font-family:sans-serif">
 
-<p>Bias: {{bias}}</p>
-<p>Trade: {{trade}}</p>
+<h2>🚀 BOT</h2>
+
+<p><b>Bias:</b> {{bias}}</p>
+<p><b>Trade:</b> {{trade}}</p>
 
 <h3>Zones</h3>
 {% for z in zones %}
-<div>{{z}}</div>
+<div>{{z.time}} | {{z.trend}} | {{z.type}} | {{z.price}}</div>
 {% endfor %}
 
 <h3>Logs</h3>
 {% for l in logs %}
 <div>{{l}}</div>
 {% endfor %}
+
 </body>
 </html>
 """
 
 @app.route('/dashboard')
-def dashboard():
-    bot_tick()  # safe, fast
+def dash():
     return render_template_string(
         HTML,
         bias=bias,
         trade=current_trade,
         zones=zones[-10:],
-        logs=reversed(log_buffer)
+        logs=reversed(get_logs())
     )
 
 @app.route('/health')
 def health():
-    return {"status": "ok"}
+    return {"status":"ok"}
 
 @app.route('/')
 def home():
-    return {"status": "running"}
+    return {"status":"running"}
 
 if __name__ == "__main__":
     app.run()
