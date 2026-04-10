@@ -16,10 +16,12 @@ trade_history = []
 log_buffer = []
 
 COOLDOWN = 180
-ZONE_TOLERANCE = 0.005  # 🔥 increased
+ZONE_TOLERANCE = 0.005
 
 MAX_AGE_FVG = 8
 MAX_AGE_OB = 15
+
+bot_started = False  # 🔥 important
 
 # ================= LOG =================
 def log(msg):
@@ -34,14 +36,11 @@ def log(msg):
 
 # ================= STATS =================
 def stats():
-    try:
-        total = len(trade_history)
-        wins = sum(1 for t in trade_history if t.get("result") == "win")
-        pnl = sum(t.get("pnl", 0) for t in trade_history)
-        winrate = (wins / total * 100) if total else 0
-        return total, round(winrate,2), round(pnl,2)
-    except:
-        return 0,0,0
+    total = len(trade_history)
+    wins = sum(1 for t in trade_history if t.get("result") == "win")
+    pnl = sum(t.get("pnl", 0) for t in trade_history)
+    winrate = (wins / total * 100) if total else 0
+    return total, round(winrate,2), round(pnl,2)
 
 # ================= PRICE =================
 def get_price():
@@ -59,9 +58,7 @@ def get_price():
                 return float(data["data"]["amount"])
             if "bitcoin" in data:
                 return float(data["bitcoin"]["usd"])
-
-        except Exception as e:
-            log(f"⚠️ API fail: {e}")
+        except:
             continue
 
     return None
@@ -121,13 +118,14 @@ def on_price_update(price):
         if len(price_data) > 50:
             price_data.pop(0)
 
-        log(f"📡 Price: {price}")
+        log(f"📡 {price}")
 
         htf = bias.get(symbol)
         if not htf:
             return
 
         valid_zones = get_valid_zones(price)
+        disp = displacement_candle()
 
         now = time.time()
 
@@ -135,7 +133,6 @@ def on_price_update(price):
 
             decision = None
             trade_type = None
-            disp = displacement_candle()
 
             # ===== SCALP =====
             for z in reversed(valid_zones[-5:]):
@@ -144,13 +141,13 @@ def on_price_update(price):
                     if htf == "buy" and "bullish" in z["type"] and disp == "buy":
                         decision = "buy"
                         trade_type = "scalp"
-                        log(f"🔵 SCALP BUY ({z['type']})")
+                        log(f"🔵 SCALP BUY {z['type']}")
                         break
 
                     elif htf == "sell" and "bearish" in z["type"] and disp == "sell":
                         decision = "sell"
                         trade_type = "scalp"
-                        log(f"🔵 SCALP SELL ({z['type']})")
+                        log(f"🔵 SCALP SELL {z['type']}")
                         break
 
             # ===== RUNNER =====
@@ -182,8 +179,7 @@ def on_price_update(price):
             }
 
             last_trade_time = now
-
-            log(f"🚀 {decision.upper()} [{trade_type}]")
+            log(f"🚀 {decision.upper()}")
 
         # ===== EXIT =====
         if current_trade:
@@ -204,21 +200,20 @@ def on_price_update(price):
                     current_trade["result"]="win"
                     current_trade["pnl"]=1.5
                     trade_history.append(current_trade)
-                    log("✅ SCALP TP")
+                    log("✅ TP")
                     current_trade=None
 
                 elif (side=="buy" and price <= sl) or (side=="sell" and price >= sl):
                     current_trade["result"]="loss"
                     current_trade["pnl"]=-1
                     trade_history.append(current_trade)
-                    log("❌ SCALP SL")
+                    log("❌ SL")
                     current_trade=None
 
             else:
                 if r >= 1.5 and not current_trade["be_moved"]:
                     current_trade["sl"] = entry
                     current_trade["be_moved"] = True
-                    log("🔒 BE moved")
 
                 if r >= 2:
                     if side=="buy":
@@ -230,7 +225,7 @@ def on_price_update(price):
                     current_trade["result"]="win" if r>0 else "loss"
                     current_trade["pnl"]=round(r,2)
                     trade_history.append(current_trade)
-                    log(f"EXIT RUNNER {round(r,2)}R")
+                    log(f"EXIT {round(r,2)}R")
                     current_trade=None
 
     except Exception as e:
@@ -243,46 +238,46 @@ def price_loop():
             price = get_price()
             if price:
                 on_price_update(price)
-            else:
-                log("⚠️ Price unavailable")
         except Exception as e:
             log(f"❌ LOOP ERROR: {e}")
         time.sleep(2)
 
-threading.Thread(target=price_loop, daemon=True).start()
+# ================= SAFE START =================
+@app.before_request
+def start_bot():
+    global bot_started
+    if not bot_started:
+        threading.Thread(target=price_loop, daemon=True).start()
+        bot_started = True
+        log("✅ Bot started")
 
 # ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    try:
-        data = request.json or {}
-        log(f"📩 {data}")
+    data = request.json or {}
+    log(f"📩 {data}")
 
-        price = float(data.get("price",0))
-        signal = str(data.get("signal","")).lower()
-        trend = str(data.get("trend","")).lower()
-        tf = str(data.get("timeframe","")).lower()
+    price = float(data.get("price",0))
+    signal = str(data.get("signal","")).lower()
+    trend = str(data.get("trend","")).lower()
+    tf = str(data.get("timeframe","")).lower()
 
-        if tf == "htf":
-            if "bos" in signal and "internal" not in signal:
-                bias[symbol] = "buy" if "bullish" in signal else "sell"
-                log(f"🎯 HTF {bias[symbol]}")
+    if tf == "htf":
+        if "bos" in signal and "internal" not in signal:
+            bias[symbol] = "buy" if "bullish" in signal else "sell"
 
-        if tf == "ltf":
-            if "swing ob" in signal or "fvg" in signal:
-                zone = ("bullish_" if "bullish" in trend else "bearish_") + ("swing_ob" if "ob" in signal else "fvg")
-                zones.append({
-                    "type": zone,
-                    "price": price,
-                    "time": time.strftime('%H:%M:%S'),
-                    "index": len(price_data)
-                })
-                log(f"📍 Zone {zone}")
+    if tf == "ltf":
+        if "swing ob" in signal or "fvg" in signal:
+            zone = ("bullish_" if "bullish" in trend else "bearish_") + ("swing_ob" if "ob" in signal else "fvg")
+            zones.append({
+                "type": zone,
+                "price": price,
+                "time": time.strftime('%H:%M:%S'),
+                "index": len(price_data)
+            })
+            log(f"📍 {zone}")
 
-        return {"ok": True}
-    except Exception as e:
-        log(f"❌ WEBHOOK ERROR: {e}")
-        return {"error": str(e)}
+    return {"ok": True}
 
 # ================= DASHBOARD =================
 HTML = """
@@ -290,22 +285,16 @@ HTML = """
 <head><meta http-equiv="refresh" content="2"></head>
 <body style="background:#0f172a;color:white;font-family:sans-serif">
 <h2>🚀 BTC BOT</h2>
+<p>Bias: {{bias}}</p>
+<p>Active: {{trade}}</p>
+<p>Trades: {{t}} | Winrate: {{wr}}% | PnL: {{pnl}}R</p>
 
-<p><b>Bias:</b> {{bias}}</p>
-<p><b>Active:</b> {{trade}}</p>
-<p><b>Trades:</b> {{t}} | <b>Winrate:</b> {{wr}}% | <b>PnL:</b> {{pnl}}R</p>
-
-<h3>📍 Zones</h3>
+<h3>Zones</h3>
 {% for z in zones %}
 <div>{{z.time}} | {{z.type}} | {{z.price}}</div>
 {% endfor %}
 
-<h3>📊 Trades</h3>
-{% for t in hist %}
-<div>{{t.display_time}} | {{t.side}} | {{t.type}} | {{t.result}} | {{t.pnl}}R</div>
-{% endfor %}
-
-<h3>📜 Logs</h3>
+<h3>Logs</h3>
 {% for l in logs %}
 <div>{{l}}</div>
 {% endfor %}
@@ -320,7 +309,6 @@ def dash():
         HTML,
         bias=bias,
         trade=current_trade,
-        hist=reversed(trade_history[-20:]),
         logs=reversed(log_buffer),
         zones=zones[-10:],
         t=t, wr=wr, pnl=pnl
@@ -335,4 +323,4 @@ def home():
     return {"status":"running"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
+    app.run()
