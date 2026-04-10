@@ -12,8 +12,9 @@ price_data = []
 current_trade = None
 last_trade_time = 0
 
-COOLDOWN = 120
+COOLDOWN = 180
 ZONE_TOLERANCE = 0.005
+LOOKBACK = 20
 
 log_file = "logs.txt"
 
@@ -54,6 +55,25 @@ def displacement():
 
     return None
 
+# ================= LIQUIDITY SWEEP =================
+def liquidity_sweep():
+    if len(price_data) < LOOKBACK + 5:
+        return None
+
+    prev_high = max(price_data[-LOOKBACK-5:-5])
+    prev_low = min(price_data[-LOOKBACK-5:-5])
+
+    price = price_data[-1]
+
+    # Sweep + rejection logic
+    if price > prev_high and price_data[-2] < prev_high:
+        return "high_sweep"
+
+    if price < prev_low and price_data[-2] > prev_low:
+        return "low_sweep"
+
+    return None
+
 # ================= BOT LOOP =================
 def bot_loop():
     global current_trade, last_trade_time
@@ -64,14 +84,15 @@ def bot_loop():
 
             if price:
                 price_data.append(price)
-                if len(price_data) > 50:
+                if len(price_data) > 100:
                     price_data.pop(0)
 
                 log(f"📡 {price}")
 
                 disp = displacement()
+                sweep = liquidity_sweep()
 
-                if bias and disp:
+                if bias and disp and sweep:
 
                     now = time.time()
 
@@ -79,21 +100,75 @@ def bot_loop():
 
                         for z in zones[-5:]:
 
+                            # Ignore weak zones
+                            if z["type"] == "internal_ob":
+                                continue
+
                             if abs(price - z["price"]) < price * ZONE_TOLERANCE:
 
                                 # ===== BUY =====
-                                if bias == "buy" and z["trend"] == "bullish" and disp == "buy":
-                                    current_trade = {"side":"buy","entry":price}
+                                if (
+                                    bias == "buy"
+                                    and z["trend"] == "bullish"
+                                    and disp == "buy"
+                                    and sweep == "low_sweep"
+                                ):
+                                    current_trade = {
+                                        "side": "buy",
+                                        "entry": price,
+                                        "sl": price * 0.998,
+                                        "be": False
+                                    }
                                     last_trade_time = now
                                     log(f"🚀 BUY ({z['type']})")
                                     break
 
                                 # ===== SELL =====
-                                elif bias == "sell" and z["trend"] == "bearish" and disp == "sell":
-                                    current_trade = {"side":"sell","entry":price}
+                                elif (
+                                    bias == "sell"
+                                    and z["trend"] == "bearish"
+                                    and disp == "sell"
+                                    and sweep == "high_sweep"
+                                ):
+                                    current_trade = {
+                                        "side": "sell",
+                                        "entry": price,
+                                        "sl": price * 1.002,
+                                        "be": False
+                                    }
                                     last_trade_time = now
                                     log(f"🚀 SELL ({z['type']})")
                                     break
+
+                # ================= EXIT =================
+                if current_trade:
+                    side = current_trade["side"]
+                    entry = current_trade["entry"]
+                    sl = current_trade["sl"]
+
+                    risk = abs(entry - sl)
+                    if risk == 0:
+                        continue
+
+                    r = (price - entry)/risk if side=="buy" else (entry - price)/risk
+
+                    # Break even
+                    if r >= 1 and not current_trade["be"]:
+                        current_trade["sl"] = entry
+                        current_trade["be"] = True
+                        log("🔒 BE moved")
+
+                    # Trailing
+                    if r >= 2:
+                        if side == "buy":
+                            current_trade["sl"] = max(current_trade["sl"], price - risk)
+                        else:
+                            current_trade["sl"] = min(current_trade["sl"], price + risk)
+
+                    # Exit
+                    if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
+                        log(f"✅ EXIT {round(r,2)}R")
+                        current_trade = None
 
         except Exception as e:
             log(f"❌ ERROR {e}")
@@ -117,16 +192,13 @@ def webhook():
 
     # ===== HTF =====
     if tf == "htf":
-
-        # PRIORITY: CHOCH
         if "choch" in signal:
             bias = "buy" if "bullish" in signal else "sell"
-            log(f"🔥 HTF CHOCH → {bias}")
+            log(f"🔥 CHOCH → {bias}")
 
-        # SECOND: BOS (only if no bias yet)
         elif "bos" in signal and bias is None:
             bias = "buy" if "bullish" in signal else "sell"
-            log(f"📊 HTF BOS → {bias}")
+            log(f"📊 BOS → {bias}")
 
     # ===== LTF =====
     if tf == "ltf":
@@ -195,4 +267,4 @@ def home():
     return {"status":"running"}
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=10000)
