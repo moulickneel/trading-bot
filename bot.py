@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string
-import time, requests, os
+import time, requests
 
 app = Flask(__name__)
 
@@ -8,20 +8,11 @@ symbol = "BTCUSD"
 bias = {}
 zones = []
 price_data = []
-
 current_trade = None
-last_trade_time = 0
 
-trade_history = []
 log_buffer = []
-
-COOLDOWN = 120
-ZONE_TOLERANCE = 0.005
-
-MAX_AGE_FVG = 8
-MAX_AGE_OB = 15
-
-last_tick = 0
+last_price = None
+last_fetch = 0
 
 # ================= LOG =================
 def log(msg):
@@ -31,13 +22,26 @@ def log(msg):
     if len(log_buffer) > 200:
         log_buffer.pop(0)
 
-# ================= PRICE =================
+# ================= SAFE PRICE =================
 def get_price():
+    global last_price, last_fetch
+
+    # fetch only every 3 seconds
+    if time.time() - last_fetch < 3:
+        return last_price
+
+    last_fetch = time.time()
+
     try:
-        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=2)
-        return float(r.json()["data"]["amount"])
+        r = requests.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            timeout=1.5
+        )
+        last_price = float(r.json()["data"]["amount"])
+        return last_price
     except:
-        return None
+        log("⚠️ price fetch fail")
+        return last_price
 
 # ================= DISPLACEMENT =================
 def displacement():
@@ -55,13 +59,8 @@ def displacement():
     return None
 
 # ================= BOT TICK =================
-def run_bot():
-    global last_tick, current_trade, last_trade_time
-
-    if time.time() - last_tick < 2:
-        return
-
-    last_tick = time.time()
+def bot_tick():
+    global current_trade
 
     price = get_price()
     if not price:
@@ -74,49 +73,23 @@ def run_bot():
     log(f"📡 {price}")
 
     htf = bias.get(symbol)
-    if not htf:
-        return
-
     disp = displacement()
 
-    now = time.time()
+    if not htf or not disp:
+        return
 
-    # ===== ENTRY =====
-    if not current_trade and now - last_trade_time > COOLDOWN:
-
-        decision = None
-
+    # ENTRY
+    if not current_trade:
         for z in zones[-5:]:
-            if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+            if abs(price - z["price"]) < price * 0.005:
 
-                if htf == "buy" and "bullish" in z["type"] and disp == "buy":
-                    decision = "buy"
-                    log("🔵 BUY")
+                if htf == "buy" and disp == "buy":
+                    current_trade = {"side": "buy", "entry": price}
+                    log("🚀 BUY")
 
-                elif htf == "sell" and "bearish" in z["type"] and disp == "sell":
-                    decision = "sell"
-                    log("🔴 SELL")
-
-        if decision:
-            sl = price * (0.999 if decision=="buy" else 1.001)
-
-            current_trade = {
-                "side": decision,
-                "entry": price,
-                "sl": sl
-            }
-
-            last_trade_time = now
-
-    # ===== EXIT =====
-    if current_trade:
-        side = current_trade["side"]
-        entry = current_trade["entry"]
-        sl = current_trade["sl"]
-
-        if (side=="buy" and price <= sl) or (side=="sell" and price >= sl):
-            log("❌ SL")
-            current_trade = None
+                elif htf == "sell" and disp == "sell":
+                    current_trade = {"side": "sell", "entry": price}
+                    log("🚀 SELL")
 
 # ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
@@ -138,7 +111,7 @@ def webhook():
     if tf == "ltf":
         if "fvg" in signal or "ob" in signal:
             zones.append({
-                "type": trend + "_zone",
+                "type": trend,
                 "price": price,
                 "time": time.strftime('%H:%M:%S')
             })
@@ -149,9 +122,10 @@ def webhook():
 # ================= DASHBOARD =================
 HTML = """
 <html>
-<head><meta http-equiv="refresh" content="2"></head>
+<head><meta http-equiv="refresh" content="3"></head>
 <body style="background:#0f172a;color:white">
-<h2>BOT</h2>
+<h2>BTC BOT</h2>
+
 <p>Bias: {{bias}}</p>
 <p>Trade: {{trade}}</p>
 
@@ -169,25 +143,23 @@ HTML = """
 """
 
 @app.route('/dashboard')
-def dash():
-    run_bot()
+def dashboard():
+    bot_tick()  # safe, fast
     return render_template_string(
         HTML,
         bias=bias,
         trade=current_trade,
-        logs=reversed(log_buffer),
-        zones=zones[-10:]
+        zones=zones[-10:],
+        logs=reversed(log_buffer)
     )
 
 @app.route('/health')
 def health():
-    run_bot()
-    return {"status":"ok"}
+    return {"status": "ok"}
 
 @app.route('/')
 def home():
-    run_bot()
-    return {"status":"running"}
+    return {"status": "running"}
 
 if __name__ == "__main__":
     app.run()
