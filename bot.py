@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string
-import time, requests, threading
+import time, requests
 
 app = Flask(__name__)
 
@@ -11,6 +11,7 @@ price_data = []
 
 current_trade = None
 last_trade_time = 0
+last_tick = 0
 
 COOLDOWN = 180
 ZONE_TOLERANCE = 0.005
@@ -33,12 +34,23 @@ def get_logs():
         return []
 
 # ================= PRICE =================
+last_price = None
+last_fetch = 0
+
 def get_price():
+    global last_price, last_fetch
+
+    if time.time() - last_fetch < 3:
+        return last_price
+
+    last_fetch = time.time()
+
     try:
-        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=2)
-        return float(r.json()["data"]["amount"])
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=1.5)
+        last_price = float(r.json()["data"]["amount"])
+        return last_price
     except:
-        return None
+        return last_price
 
 # ================= DISPLACEMENT =================
 def displacement():
@@ -55,7 +67,7 @@ def displacement():
 
     return None
 
-# ================= LIQUIDITY SWEEP =================
+# ================= LIQUIDITY =================
 def liquidity_sweep():
     if len(price_data) < LOOKBACK + 5:
         return None
@@ -65,7 +77,6 @@ def liquidity_sweep():
 
     price = price_data[-1]
 
-    # Sweep + rejection logic
     if price > prev_high and price_data[-2] < prev_high:
         return "high_sweep"
 
@@ -74,108 +85,80 @@ def liquidity_sweep():
 
     return None
 
-# ================= BOT LOOP =================
-def bot_loop():
-    global current_trade, last_trade_time
+# ================= BOT TICK =================
+def bot_tick():
+    global current_trade, last_trade_time, last_tick
 
-    while True:
-        try:
-            price = get_price()
+    if time.time() - last_tick < 2:
+        return
 
-            if price:
-                price_data.append(price)
-                if len(price_data) > 100:
-                    price_data.pop(0)
+    last_tick = time.time()
 
-                log(f"📡 {price}")
+    price = get_price()
+    if not price:
+        return
 
-                disp = displacement()
-                sweep = liquidity_sweep()
+    price_data.append(price)
+    if len(price_data) > 100:
+        price_data.pop(0)
 
-                if bias and disp and sweep:
+    log(f"📡 {price}")
 
-                    now = time.time()
+    disp = displacement()
+    sweep = liquidity_sweep()
 
-                    if not current_trade and now - last_trade_time > COOLDOWN:
+    now = time.time()
 
-                        for z in zones[-5:]:
+    # ===== ENTRY =====
+    if bias and disp and sweep:
 
-                            # Ignore weak zones
-                            if z["type"] == "internal_ob":
-                                continue
+        if not current_trade and now - last_trade_time > COOLDOWN:
 
-                            if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+            for z in zones[-5:]:
 
-                                # ===== BUY =====
-                                if (
-                                    bias == "buy"
-                                    and z["trend"] == "bullish"
-                                    and disp == "buy"
-                                    and sweep == "low_sweep"
-                                ):
-                                    current_trade = {
-                                        "side": "buy",
-                                        "entry": price,
-                                        "sl": price * 0.998,
-                                        "be": False
-                                    }
-                                    last_trade_time = now
-                                    log(f"🚀 BUY ({z['type']})")
-                                    break
+                if z["type"] == "internal_ob":
+                    continue
 
-                                # ===== SELL =====
-                                elif (
-                                    bias == "sell"
-                                    and z["trend"] == "bearish"
-                                    and disp == "sell"
-                                    and sweep == "high_sweep"
-                                ):
-                                    current_trade = {
-                                        "side": "sell",
-                                        "entry": price,
-                                        "sl": price * 1.002,
-                                        "be": False
-                                    }
-                                    last_trade_time = now
-                                    log(f"🚀 SELL ({z['type']})")
-                                    break
+                if abs(price - z["price"]) < price * ZONE_TOLERANCE:
 
-                # ================= EXIT =================
-                if current_trade:
-                    side = current_trade["side"]
-                    entry = current_trade["entry"]
-                    sl = current_trade["sl"]
+                    if bias == "buy" and z["trend"] == "bullish" and disp == "buy" and sweep == "low_sweep":
+                        current_trade = {"side":"buy","entry":price,"sl":price*0.998,"be":False}
+                        last_trade_time = now
+                        log("🚀 BUY")
+                        break
 
-                    risk = abs(entry - sl)
-                    if risk == 0:
-                        continue
+                    elif bias == "sell" and z["trend"] == "bearish" and disp == "sell" and sweep == "high_sweep":
+                        current_trade = {"side":"sell","entry":price,"sl":price*1.002,"be":False}
+                        last_trade_time = now
+                        log("🚀 SELL")
+                        break
 
-                    r = (price - entry)/risk if side=="buy" else (entry - price)/risk
+    # ===== EXIT =====
+    if current_trade:
+        side = current_trade["side"]
+        entry = current_trade["entry"]
+        sl = current_trade["sl"]
 
-                    # Break even
-                    if r >= 1 and not current_trade["be"]:
-                        current_trade["sl"] = entry
-                        current_trade["be"] = True
-                        log("🔒 BE moved")
+        risk = abs(entry - sl)
+        if risk == 0:
+            return
 
-                    # Trailing
-                    if r >= 2:
-                        if side == "buy":
-                            current_trade["sl"] = max(current_trade["sl"], price - risk)
-                        else:
-                            current_trade["sl"] = min(current_trade["sl"], price + risk)
+        r = (price - entry)/risk if side=="buy" else (entry - price)/risk
 
-                    # Exit
-                    if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
-                        log(f"✅ EXIT {round(r,2)}R")
-                        current_trade = None
+        if r >= 1 and not current_trade["be"]:
+            current_trade["sl"] = entry
+            current_trade["be"] = True
+            log("🔒 BE")
 
-        except Exception as e:
-            log(f"❌ ERROR {e}")
+        if r >= 2:
+            if side == "buy":
+                current_trade["sl"] = max(current_trade["sl"], price - risk)
+            else:
+                current_trade["sl"] = min(current_trade["sl"], price + risk)
 
-        time.sleep(2)
-
-threading.Thread(target=bot_loop, daemon=True).start()
+        if (side=="buy" and price <= current_trade["sl"]) or (side=="sell" and price >= current_trade["sl"]):
+            log(f"✅ EXIT {round(r,2)}R")
+            current_trade = None
 
 # ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
@@ -190,7 +173,6 @@ def webhook():
     tf = str(data.get("timeframe","")).lower()
     price = float(data.get("price",0))
 
-    # ===== HTF =====
     if tf == "htf":
         if "choch" in signal:
             bias = "buy" if "bullish" in signal else "sell"
@@ -200,9 +182,7 @@ def webhook():
             bias = "buy" if "bullish" in signal else "sell"
             log(f"📊 BOS → {bias}")
 
-    # ===== LTF =====
     if tf == "ltf":
-
         if "fvg" in signal:
             ztype = "fvg"
         elif "swing ob" in signal:
@@ -212,13 +192,7 @@ def webhook():
         else:
             return {"ok": True}
 
-        zones.append({
-            "type": ztype,
-            "trend": trend,
-            "price": price,
-            "time": time.strftime('%H:%M:%S')
-        })
-
+        zones.append({"type":ztype,"trend":trend,"price":price,"time":time.strftime('%H:%M:%S')})
         log(f"📍 {trend} {ztype}")
 
     return {"ok": True}
@@ -227,44 +201,35 @@ def webhook():
 HTML = """
 <html>
 <head><meta http-equiv="refresh" content="3"></head>
-<body style="background:#0f172a;color:white;font-family:sans-serif">
-
-<h2>🚀 BOT</h2>
-
-<p><b>Bias:</b> {{bias}}</p>
-<p><b>Trade:</b> {{trade}}</p>
+<body style="background:#0f172a;color:white">
+<h2>BOT</h2>
+<p>Bias: {{bias}}</p>
+<p>Trade: {{trade}}</p>
 
 <h3>Zones</h3>
 {% for z in zones %}
-<div>{{z.time}} | {{z.trend}} | {{z.type}} | {{z.price}}</div>
+<div>{{z}}</div>
 {% endfor %}
 
 <h3>Logs</h3>
 {% for l in logs %}
 <div>{{l}}</div>
 {% endfor %}
-
 </body>
 </html>
 """
 
 @app.route('/dashboard')
 def dash():
-    return render_template_string(
-        HTML,
-        bias=bias,
-        trade=current_trade,
-        zones=zones[-10:],
-        logs=reversed(get_logs())
-    )
+    bot_tick()
+    return render_template_string(HTML, bias=bias, trade=current_trade, zones=zones[-10:], logs=reversed(get_logs()))
 
 @app.route('/health')
 def health():
+    bot_tick()
     return {"status":"ok"}
 
 @app.route('/')
 def home():
+    bot_tick()
     return {"status":"running"}
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
