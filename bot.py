@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string
-import time, json
+import time
 
 app = Flask(__name__)
 
@@ -7,12 +7,11 @@ symbol = "BTCUSD"
 
 bias = None
 zones = []
-price_data = []
 current_trade = None
 last_trade_time = 0
 
 COOLDOWN = 180
-ZONE_TOLERANCE = 0.005
+ZONE_TTL = 75 * 60  # 75 minutes
 
 log_file = "logs.txt"
 
@@ -30,47 +29,58 @@ def get_logs():
     except:
         return []
 
-# ================= CORE ENGINE =================
-def process_signal(price):
-    global current_trade, last_trade_time
+# ================= CLEAN OLD ZONES =================
+def clean_zones():
+    now = time.time()
+    return [z for z in zones if now - z["timestamp"] < ZONE_TTL]
 
-    price_data.append(price)
-    if len(price_data) > 50:
-        price_data.pop(0)
+# ================= ENTRY ENGINE =================
+def try_trade(price):
+    global current_trade, last_trade_time, zones
 
-    log(f"📡 {price}")
+    zones = clean_zones()
+
+    now = time.time()
 
     if not bias:
         return
 
-    # ===== ENTRY =====
-    now = time.time()
+    if current_trade or now - last_trade_time < COOLDOWN:
+        return
 
-    if not current_trade and now - last_trade_time > COOLDOWN:
+    for z in zones[-5:]:
 
-        for z in zones[-5:]:
+        # Skip weak zones
+        if z["type"] == "internal_ob":
+            continue
 
-            if z["type"] == "internal_ob":
-                continue
+        # Price near zone
+        if abs(price - z["price"]) < price * 0.005:
 
-            if abs(price - z["price"]) < price * ZONE_TOLERANCE:
+            if bias == "buy" and z["trend"] == "bullish":
+                current_trade = {
+                    "side": "buy",
+                    "entry": price,
+                    "time": time.strftime('%H:%M:%S')
+                }
+                last_trade_time = now
+                log(f"🚀 BUY ({z['type']})")
+                return
 
-                if bias == "buy" and z["trend"] == "bullish":
-                    current_trade = {"side":"buy","entry":price}
-                    last_trade_time = now
-                    log("🚀 BUY")
-                    break
-
-                elif bias == "sell" and z["trend"] == "bearish":
-                    current_trade = {"side":"sell","entry":price}
-                    last_trade_time = now
-                    log("🚀 SELL")
-                    break
+            elif bias == "sell" and z["trend"] == "bearish":
+                current_trade = {
+                    "side": "sell",
+                    "entry": price,
+                    "time": time.strftime('%H:%M:%S')
+                }
+                last_trade_time = now
+                log(f"🚀 SELL ({z['type']})")
+                return
 
 # ================= WEBHOOK =================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    global bias
+    global bias, zones
 
     data = request.json or {}
     log(f"📩 {data}")
@@ -82,6 +92,7 @@ def webhook():
 
     # ===== HTF =====
     if tf == "htf":
+
         if "choch" in signal:
             bias = "buy" if "bullish" in signal else "sell"
             log(f"🔥 CHOCH → {bias}")
@@ -102,17 +113,19 @@ def webhook():
         else:
             return {"ok": True}
 
-        zones.append({
+        zone = {
             "type": ztype,
             "trend": trend,
             "price": price,
+            "timestamp": time.time(),
             "time": time.strftime('%H:%M:%S')
-        })
+        }
 
+        zones.append(zone)
         log(f"📍 {trend} {ztype}")
 
-        # 🚀 PROCESS ENTRY ONLY WHEN LTF ARRIVES
-        process_signal(price)
+        # 🚀 ENTRY TRIGGERED HERE (NO LOOP)
+        try_trade(price)
 
     return {"ok": True}
 
@@ -124,12 +137,12 @@ HTML = """
 
 <h2>BOT</h2>
 
-<p>Bias: {{bias}}</p>
-<p>Trade: {{trade}}</p>
+<p><b>Bias:</b> {{bias}}</p>
+<p><b>Trade:</b> {{trade}}</p>
 
 <h3>Zones</h3>
 {% for z in zones %}
-<div>{{z}}</div>
+<div>{{z.time}} | {{z.type}} | {{z.price}}</div>
 {% endfor %}
 
 <h3>Logs</h3>
